@@ -1,0 +1,2 @@
+ckpt/1.2b/model.safetensors filter=lfs diff=lfs merge=lfs -text
+ckpt/1.2b/model.safetensors !text !filter !merge !diff
