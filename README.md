@@ -38,7 +38,21 @@ python3 run.py run -- generate --model DIR --prompt "hello"
 ```
 
 `run.py test` needs `torch` and `transformers`, which `python3 run.py install`
-provides. Nothing else in the project does.
+provides. The engine itself has no dependencies at all.
+
+The `bench/` directory holds the scripts used to check the engine against the
+published checkpoint; they lean on the same `run.py install` environment.
+
+```sh
+python3 bench/download_model.py                        # fetch LFM2.5-2.6B into models/
+python3 bench/make_index.py                            # only if the shards ship no index
+python3 bench/bench_hf.py --threads 8                  # transformers throughput, to compare
+python3 bench/equivalent.py                            # illlm vs transformers logits
+python3 bench/longform.py                              # greedy continuations, side by side
+```
+
+Compare like with like: `bench_hf.py` runs bf16, so put `run.py bench` at bf16
+too rather than quoting it against `--quant q8`.
 
 ## What it runs
 
