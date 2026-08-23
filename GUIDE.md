@@ -17,7 +17,7 @@ arranged, and where to change it.
 
 ## 1. The shape of the project
 
-Five source files, flat, no build system.
+Five source files, flat, no build system, plus a `bench/` directory of scripts.
 
 | file | lines | role |
 | --- | --- | --- |
@@ -26,6 +26,7 @@ Five source files, flat, no build system.
 | `app_test.c` | ~800 | unit tests over the engine internals |
 | `app_test.py` | ~565 | comparison against Hugging Face `transformers` |
 | `run.py` | ~280 | install, build, test, run, bench, clean |
+| `bench/` | ~430 | scripts that measure and compare against the real checkpoint |
 
 `app_main.c` and `app_test.c` each begin with `#include "app_core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
