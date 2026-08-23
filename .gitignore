@@ -1,0 +1,26 @@
+# --- build artifacts ---
+build/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-hf/
+*.obj
+*.o
+*.exe
+*.pdb
+
+# --- downloaded model checkpoints (several GiB, kept local only) ---
+models/
+
+# --- Hugging Face download cache ---
+.hf-cache/
+
+# --- editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
