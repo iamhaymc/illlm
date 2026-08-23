@@ -1,5 +1,10 @@
 # --- build artifacts ---
 build/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
 
 # --- Python ---
 __pycache__/
@@ -7,10 +12,6 @@ __pycache__/
 *.egg-info/
 .venv/
 .venv-hf/
-*.obj
-*.o
-*.exe
-*.pdb
 
 # --- downloaded model checkpoints (several GiB, kept local only) ---
 models/
