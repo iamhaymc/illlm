@@ -292,7 +292,41 @@ double ill_clock_now(void);   /* monotonic seconds */
 #  include <pthread.h>
 #endif
 
-#if defined(__STDC_NO_ATOMICS__) || (defined(__STDC_VERSION__) && __STDC_VERSION__ < 201112L)
+#if defined(_MSC_VER) && !defined(__clang__) && \
+    (defined(_M_IX86) || defined(_M_X64)) && !defined(ILL_NO_THREADS)
+/* MSVC reports __STDC_NO_ATOMICS__ and ships no working C11 <stdatomic.h>,
+ * but the thread pool needs only a sliver of the atomic surface.  Back it
+ * with the interlocked intrinsics instead.
+ *
+ * Scoped to x86 and x64 deliberately.  The loads below are plain volatile
+ * reads, which carry acquire ordering on this architecture once the
+ * compiler is told not to sink them.  On ARM64 they would not: MSVC
+ * defaults to /volatile:iso there and the hardware reorders freely, so a
+ * worker could read pool->chore before it observed the epoch that
+ * published it.  That target keeps the single threaded fallback until the
+ * loads below grow real barriers.  clang-cl also defines _MSC_VER but
+ * ships a working <stdatomic.h>, so it skips this shim entirely. */
+#  include <intrin.h>
+#  define ILL_HAS_ATOMIC 1
+typedef volatile LONG IllAtomic32;
+#  define atomic_int_least32_t   IllAtomic32
+#  define atomic_uint_least32_t  IllAtomic32
+#  define atomic_int             IllAtomic32
+#  define memory_order_relaxed   0
+#  define memory_order_acquire   2
+#  define memory_order_release   3
+static __forceinline LONG ill_msvc_load_acquire(volatile const LONG *cell)
+{
+    LONG seen = *cell;
+    _ReadWriteBarrier();   /* x86 loads are acquire; stop the compiler alone */
+    return seen;
+}
+#  define atomic_load(p)                      ill_msvc_load_acquire((volatile const LONG *)(p))
+#  define atomic_load_explicit(p, mo)         ill_msvc_load_acquire((volatile const LONG *)(p))
+#  define atomic_store(p, v)                  ((void)_InterlockedExchange((volatile LONG *)(p), (LONG)(v)))
+#  define atomic_fetch_add(p, v)              _InterlockedExchangeAdd((volatile LONG *)(p), (LONG)(v))
+#  define atomic_fetch_add_explicit(p, v, mo) _InterlockedExchangeAdd((volatile LONG *)(p), (LONG)(v))
+#elif defined(__STDC_NO_ATOMICS__) || (defined(__STDC_VERSION__) && __STDC_VERSION__ < 201112L)
 #  define ILL_HAS_ATOMIC 0
 #else
 #  define ILL_HAS_ATOMIC 1
@@ -877,7 +911,7 @@ static inline IllVec ill_vec_f16(const uint16_t *p)
     return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)p));
 }
 
-#elif defined(ILL_ARCH_X86) && defined(__AVX2__) && defined(__FMA__) && !defined(ILL_NO_SIMD)
+#elif defined(ILL_ARCH_X86) && defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER)) && !defined(ILL_NO_SIMD)
 #  define ILL_SIMD_NAME "avx2"
 #  define ILL_VW 8
 #  include <immintrin.h>
@@ -915,7 +949,7 @@ static inline IllVec ill_vec_bf16(const uint16_t *p)
 }
 static inline IllVec ill_vec_f16(const uint16_t *p)
 {
-#if defined(__F16C__)
+#if defined(__F16C__) || defined(_MSC_VER)
     return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
 #else
     float cell[8];
@@ -1035,8 +1069,8 @@ static void ill_q8_pack(const float *src, int32_t count, int8_t *quant, float *s
         /* Branch free so the compiler can widen this loop as well. */
         for (slot = 0; slot < span; ++slot) {
             float   tick = cell[slot] * back;
-            float   near = tick + (tick < 0.0f ? -0.5f : 0.5f);
-            int32_t cast = (int32_t)near;
+            float   snap = tick + (tick < 0.0f ? -0.5f : 0.5f);
+            int32_t cast = (int32_t)snap;
             cast = cast >  127 ?  127 : cast;
             cast = cast < -127 ? -127 : cast;
             dest[slot] = (int8_t)cast;

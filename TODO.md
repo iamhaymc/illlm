@@ -6,17 +6,30 @@ for the engine to run correctly today.
 ## Verification
 
 - Run `run.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
-  weights. Everything the checkpoint exercises is covered by the synthetic
-  suite, but the real weights have never been through this engine.
-- Confirm the tokenizer flavour of the published checkpoint. The engine reads
-  byte level BPE and reports anything else; if LFM2.5 ships something different,
-  that path needs writing.
+  weights. Partly done: `info` and `generate` run against the published
+  checkpoint (2.69B, 30 layers: 8 attention + 22 convolution), prefill and
+  decode both produce coherent text, and `bench/equivalent.py` compares logits
+  against transformers on that checkpoint. The full harness -- every
+  architectural shape plus the tokenizer corpus -- has not been run against the
+  real weights yet, which is what this item asks for.
+- ~~Confirm the tokenizer flavour of the published checkpoint.~~ LFM2.5 ships
+  byte level BPE (128000 pieces, 124 added tokens, llama3 split), which the
+  engine reads.
 - Confirm the chat template. Prompt shaping detects `<|im_start|>` in the
   vocabulary rather than evaluating the Jinja template, and `--raw` bypasses it.
-- Build and run the test suite on Windows with MSVC. The Win32 file mapping and
-  thread paths are written and guarded but have not been compiled.
+  The checkpoint's chat_template.jinja is present; the detector matched the
+  chatml flavour.
+- ~~Build and run the test suite on Windows with MSVC.~~ Done on x64: compiles
+  with MSVC 19.42 after two fixes in app_core.c -- the `near` local (a Win32
+  macro) renamed, and an atomic shim (Interlocked-based) so the Win32 thread
+  pool engages instead of falling back to single threaded. 73 checks pass.
+  The shim is scoped to x86/x64; see the arm64 item below.
 - Build and run the test suite on arm64. The NEON instantiation of the vector
-  vocabulary has not been compiled on hardware.
+  vocabulary has not been compiled on hardware. On MSVC/arm64 specifically the
+  engine still takes the single threaded fallback: the atomic shim's loads are
+  plain volatile reads, which are acquire on x86 but not under `/volatile:iso`
+  on arm64, and `ill_cpu_pause` has no MSVC arm64 arm. Both need real barriers
+  before that target can enable the pool.
 - Add a perplexity command so accuracy loss from `--quant q8` can be reported as
   a number rather than as a correlation.
 

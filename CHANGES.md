@@ -4,6 +4,57 @@ Development progress and the reasoning behind it, newest first.
 
 ---
 
+## unreleased — MSVC support and checkpoint verification
+
+Verified the engine against the published `LiquidAI/LFM2.5-2.6B` checkpoint and
+got it building under MSVC on Windows.
+
+### Engine
+
+- **MSVC builds.** Three fixes in `app_core.c`. A local named `near` collided
+  with the Win32 macro of that name and is now `snap` — `round` was tried
+  first, but that shadows `<math.h>` and warns under `/W4`. The AVX2 vector
+  branch now accepts MSVC, which never defines `__FMA__` even though
+  `/arch:AVX2` provides FMA; the same reasoning applies to `__F16C__`, so the
+  half precision load takes the intrinsic there too instead of a scalar loop.
+- **An atomic shim for MSVC**, backed by the interlocked intrinsics, so the
+  Win32 thread pool engages rather than falling back to single threaded.
+  MSVC reports `__STDC_NO_ATOMICS__` and ships no working C11 `<stdatomic.h>`.
+
+  The shim is deliberately scoped to x86 and x64. Its loads are plain volatile
+  reads, which carry acquire ordering on those architectures once the compiler
+  is stopped from sinking them, but not on arm64, where MSVC defaults to
+  `/volatile:iso`; there a worker could read `pool->chore` before observing the
+  epoch that published it. arm64 keeps the single threaded fallback until those
+  loads grow real barriers. clang-cl defines `_MSC_VER` too but has a working
+  `<stdatomic.h>`, so it skips the shim.
+
+### `bench/`
+
+Scripts for measuring and comparing against the real checkpoint, kept out of
+the test harness because they need a multi gigabyte download.
+
+- `download_model.py` — pull the checkpoint from Hugging Face.
+- `make_index.py` — write a safetensors index for index-less shards.
+- `bench_hf.py` — prefill and decode throughput under `transformers` on CPU.
+- `equivalent.py` — logits comparison against `transformers`.
+- `longform.py` — greedy continuation comparison.
+- `common.py` — path handling shared by the above.
+
+`app_test.py` remains the authoritative equivalence check: it covers every
+architectural shape plus the tokenizer, and `run.py test --model DIR` points it
+at a real checkpoint. `equivalent.py` is a bench-side probe over one checkpoint
+and reports the same pair of metrics — max relative error and top-1 agreement —
+so the two agree on what "equivalent" means.
+
+### Results
+
+- 73/73 unit checks pass with threads enabled under MSVC 19.42 on x64.
+- q8 holds 2.83 GiB resident against the checkpoint's 30 layers (8 attention,
+  22 convolution).
+
+---
+
 ## 1.0.0 — initial engine
 
 A complete inference engine for the Liquid architecture (`model_type: "lfm2"`),
