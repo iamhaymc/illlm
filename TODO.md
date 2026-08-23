@@ -5,16 +5,21 @@ for the engine to run correctly today.
 
 ## Verification
 
-- Run `run.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
-  weights. Everything the checkpoint exercises is covered by the synthetic
-  suite, but the real weights have never been through this engine.
-- Confirm the tokenizer flavour of the published checkpoint. The engine reads
-  byte level BPE and reports anything else; if LFM2.5 ships something different,
-  that path needs writing.
+- ~~Run `run.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
+  weights.~~ Done: `info` and `generate` run against the published checkpoint
+  (2.69B, 30 layers: 8 attention + 22 convolution); prefill and decode both
+  produce coherent text.
+- ~~Confirm the tokenizer flavour of the published checkpoint.~~ LFM2.5 ships
+  byte level BPE (128000 pieces, 124 added tokens, llama3 split), which the
+  engine reads.
 - Confirm the chat template. Prompt shaping detects `<|im_start|>` in the
   vocabulary rather than evaluating the Jinja template, and `--raw` bypasses it.
-- Build and run the test suite on Windows with MSVC. The Win32 file mapping and
-  thread paths are written and guarded but have not been compiled.
+  The checkpoint's chat_template.jinja is present; the detector matched the
+  chatml flavour.
+- ~~Build and run the test suite on Windows with MSVC.~~ Compiles clean with
+  MSVC 19.42 after two fixes in app_core.c: the `near` local (Win32 macro)
+  renamed to `round`, and an MSVC atomic shim (Interlocked-based) so the Win32
+  thread pool engages instead of falling back to single threaded. 73 checks pass.
 - Build and run the test suite on arm64. The NEON instantiation of the vector
   vocabulary has not been compiled on hardware.
 - Add a perplexity command so accuracy loss from `--quant q8` can be reported as
