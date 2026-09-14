@@ -1,0 +1,10 @@
+# The checkpoint under `model/` is stored with Git LFS.
+#
+# The weight shards are hundreds of megabytes of opaque binary; keeping them in
+# the object store would put a whole copy of every shard in history for every
+# revision of it, and `tokenizer.json` is thirty megabytes of one long line that
+# no diff can usefully describe. Everything else in the repository is text and
+# is left exactly as git already handles it — no `text` or `eol` rules here, so
+# adding this file renormalizes nothing.
+model/*.safetensors filter=lfs diff=lfs merge=lfs -text
+model/tokenizer.json filter=lfs diff=lfs merge=lfs -text
