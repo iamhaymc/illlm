@@ -194,6 +194,8 @@ def do_test(args):
     cmd = [python, os.path.join(ROOT, "app_test.py"), "--binary", binary]
     if args.model:
         cmd += ["--model", args.model]
+    if args.no_checkpoint:
+        cmd += ["--no-checkpoint"]
     if args.filter:
         cmd += ["--filter", args.filter]
     return call(cmd)
@@ -215,13 +217,14 @@ def do_bench(args):
     code = do_build(args)
     if code != 0:
         return code
-    if not args.model:
-        print("bench needs --model PATH")
+    model = args.model or os.path.join(ROOT, "model")
+    if not os.path.isdir(model):
+        print(f"bench needs a checkpoint: {model} not found; pass --model PATH")
         return 1
     suffix = ".exe" if os.name == "nt" else ""
     say("bench")
     return call([os.path.join(BUILD, "app_main" + suffix), "bench",
-                 "--model", args.model, *args.rest])
+                 "--model", model, *args.rest])
 
 
 def do_clean(args):
@@ -261,6 +264,8 @@ def main():
     parser.add_argument("--debug", action="store_true", help="unoptimised build")
     parser.add_argument("--sanitize", action="store_true", help="address and ub sanitizers")
     parser.add_argument("--model", default=None, help="checkpoint folder")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="skip the checkpoint suite even when ./model exists")
     parser.add_argument("--filter", default=None, help="subset of reference checks to run")
     # Everything after a literal `--` belongs to app_main, not to this script,
     # so it is split off before argparse sees it.

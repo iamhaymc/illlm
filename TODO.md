@@ -8,10 +8,10 @@ for the engine to run correctly today.
 - Run `run.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
   weights. Partly done: `info` and `generate` run against the published
   checkpoint (2.69B, 30 layers: 8 attention + 22 convolution), prefill and
-  decode both produce coherent text, and `bench/equivalent.py` compares logits
-  against transformers on that checkpoint. The full harness -- every
-  architectural shape plus the tokenizer corpus -- has not been run against the
-  real weights yet, which is what this item asks for.
+  decode both produce coherent text, and the harness compares logits against
+  transformers on that checkpoint. The full harness -- every architectural
+  shape plus the tokenizer corpus -- has not been run against the real weights
+  yet, which is what this item asks for.
 - ~~Confirm the tokenizer flavour of the published checkpoint.~~ LFM2.5 ships
   byte level BPE (128000 pieces, 124 added tokens, llama3 split), which the
   engine reads.

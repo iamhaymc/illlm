@@ -221,3 +221,65 @@ Rather than duplicate the operations, the layering was fixed: number formats,
 then the vector vocabulary, then block quantisation, then everything that uses
 them. Fifteen parts instead of thirteen, and every part now depends only on the
 parts above it.
+
+---
+
+## 1.1.0 — the checkpoint suite folds into the test harness
+
+The `bench/` directory is gone. Its comparisons live in `app_test.py` now, and
+the published checkpoint ships in `model/`, so the whole suite runs without a
+download.
+
+### What it took
+
+- `bench/equivalent.py` and `bench/longform.py` were probes over one real
+  checkpoint; `app_test.py` already ran the same pair of metrics over every
+  architectural shape. The checkpoint branch of the harness now also runs a
+  throughput comparison and a greedy comparison, so one script covers what
+  three did.
+- `bench/bench_hf.py` measured transformers' prefill and decode beside the
+  engine's `bench`. That comparison is now `checkpoint/throughput` in the
+  harness: both sides at bf16, the same thread count, the same fill and step
+  counts. Quoting the engine's q8 against the reference's bf16 would fold a
+  weight width difference into what looks like an engine difference, so the
+  harness never does it.
+- The greedy comparison is judged on the shared prefix of ids, not of text:
+  `generate` emits decoded text, and re-encoding text to recover ids is not a
+  round trip, so re-encoding would report divergence the engines never
+  produced. The bar is measured, not assumed: the reference is run against
+  itself, primed one token at a time against one forward over the whole
+  prompt, and the engine is allowed to follow half as far as the reference
+  follows itself before it is called wrong.
+- `bench/download_model.py`, `bench/make_index.py`, and `bench/reshard.py` are
+  gone with the rest. The checkpoint is in the repository, so there is nothing
+  to download; the shards ship with an index and under the LFS cap, so there
+  is nothing to repair.
+- `app_test.py` takes `--model` defaulting to `./model`, `--no-checkpoint` to
+  skip the branch, and treats a missing checkpoint folder as a skip rather
+  than a failure: the synthetic suite is the parity argument and runs without
+  it.
+
+### What it is worth
+
+One command, `python3 run.py test`, now answers every question the bench
+scripts answered: is the arithmetic right, does the tokenizer agree, is the
+engine at least as fast as the reference doing the same work, and does a
+greedy continuation hold. Nothing to download first.
+
+### That it is the same answer
+
+`checkpoint/logits` and `checkpoint/tokenizer` are the checks `equivalent.py`
+and the tokenizer probe ran, unchanged, over the same checkpoint. The
+throughput and greedy checks are new to the harness but measure what
+`bench_hf.py` and `longform.py` measured, with the bar for the greedy
+comparison tightened from a fixed threshold to the reference's own movement.
+
+### Code
+
+`app_test.py` grew the two checks and the default model path. `bench/` is
+deleted. `README.md`, `GUIDE.md`, and `TODO.md` no longer name it.
+
+### Tests
+
+The synthetic suite is untouched and still passes. The checkpoint suite runs
+against `model/` by default.

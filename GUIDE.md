@@ -17,16 +17,17 @@ arranged, and where to change it.
 
 ## 1. The shape of the project
 
-Five source files, flat, no build system, plus a `bench/` directory of scripts.
+Five source files, flat, no build system, plus the published checkpoint in
+`model/`.
 
 | file | lines | role |
 | --- | --- | --- |
 | `app_core.c` | ~4460 | the engine: a header and its implementation in one file |
 | `app_main.c` | ~675 | the command line, six verbs |
 | `app_test.c` | ~800 | unit tests over the engine internals |
-| `app_test.py` | ~565 | comparison against Hugging Face `transformers` |
+| `app_test.py` | ~760 | comparison against Hugging Face `transformers` |
 | `run.py` | ~280 | install, build, test, run, bench, clean |
-| `bench/` | ~430 | scripts that measure and compare against the real checkpoint |
+| `model/` | — | the published LFM2.5-2.6B checkpoint the test suite runs against |
 
 `app_main.c` and `app_test.c` each begin with `#include "app_core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
@@ -466,7 +467,27 @@ Against f32 checkpoints the engine matches to 2e-7 relative — float32 rounding
 UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
 A real checkpoint is tested the same way: `run.py test --model PATH` adds a
-logits comparison and a tokenizer comparison against it.
+logits comparison and a tokenizer comparison against it. The published
+LFM2.5-2.6B weights ship in `model/`, so this runs by default, and it adds two
+further checks the synthetic suite cannot make:
+
+- **throughput** — the engine's `bench` beside transformers doing the same
+  shape of work: one batch of 256 tokens, then 64 single-token steps with the
+  cache carried, both at bf16 and the same thread count. Quoting the engine's
+  q8 against the reference's bf16 would fold a weight width difference into
+  what looks like an engine difference.
+- **greedy behaviour** — continuations from the same ids under identical greedy
+  settings, compared on the shared prefix of ids. The comparison is on ids, not
+  on text: `generate` emits decoded text, and re-encoding text to recover ids
+  is not a round trip — the tokenizer can segment the same string differently —
+  so re-encoding would report divergence the engines never produced. Where a
+  greedy chain parts is one draw from a lottery on both sides — the reference
+  primed one token at a time parts from itself somewhere too — so the engine is
+  allowed to follow half as far as the reference follows itself before it is
+  called wrong.
+
+A missing checkpoint folder is a skip, not a failure: the synthetic suite is
+the parity argument and runs without it.
 
 ---
 
