@@ -12,16 +12,16 @@ results** before quoting a number or reopening an idea.
 
 ## 1. The files, and what each is for
 
-| file | what belongs in it | what must never go in it |
-| --- | --- | --- |
-| `app_core.c` | the whole engine, one translation unit, eleven layers bottom-up | anything a second file would have to be created for |
-| `app_main.c` | the command line front end | engine logic |
-| `app_test.c` | the unit tests; includes `app_core.c` | anything that needs a checkpoint it cannot make |
-| `CHANGES.md` | **the archive** — every version, its reasoning, its numbers, its refusals | anything still open |
-| `TODO.md` | **open items only**, most consequential first | progress, rationale, history, closed work |
-| `README.md` | what the engine is, how to run it, what the flags do, where it stands | version archaeology, pass-by-pass narrative |
-| `GUIDE.md` | a tour of the implementation, layer by layer | performance history |
-| `AGENTS.md` | this file | anything specific to one change |
+| file         | what belongs in it                                                        | what must never go in it                            |
+| ------------ | ------------------------------------------------------------------------- | --------------------------------------------------- |
+| `app_core.c` | the whole engine, one translation unit, eleven layers bottom-up           | anything a second file would have to be created for |
+| `app_main.c` | the command line front end                                                | engine logic                                        |
+| `app_test.c` | the unit tests; includes `app_core.c`                                     | anything that needs a checkpoint it cannot make     |
+| `CHANGES.md` | **the archive** — every version, its reasoning, its numbers, its refusals | anything still open                                 |
+| `TODO.md`    | **open items only**, most consequential first                             | progress, rationale, history, closed work           |
+| `README.md`  | what the engine is, how to run it, what the flags do, where it stands     | version archaeology, pass-by-pass narrative         |
+| `GUIDE.md`   | a tour of the implementation, layer by layer                              | performance history                                 |
+| `AGENTS.md`  | this file                                                                 | anything specific to one change                     |
 
 The four `.py` files are the reference comparison and the build workflow, not
 part of the engine. `run.py` is the only build system there is.
@@ -41,7 +41,7 @@ repair, because every other document indexes into it.
   entry that says what it corrects, which is how 0.8.11's ranking, 0.8.14's
   correction of it and 0.9.2's correction of the mlp ratio all read today.
 - **One version number per change set**, as `## X.Y.Z — a short lowercase
-  phrase`, separated from the entry before it by a blank line, `---`, and a
+phrase`, separated from the entry before it by a blank line, `---`, and a
   blank line. Bump the patch digit; the minor digit moves when a run of work
   closes a theme.
 - **A version number marks an engine change.** Documentation-only work does not
@@ -88,7 +88,7 @@ earlier ones.
 - Take a figure as the **minimum a phase reaches** over runs alternating
   between the two builds, on a quiet machine with the checkpoint in the page
   cache. Watch for a host that drifts over a series — reverse the order of the
-  builds and see whether the first run of *whichever* went first is ahead.
+  builds and see whether the first run of _whichever_ went first is ahead.
 - **A refusal is a result and is written up with its numbers.** Say what was
   tried, what it measured, and why it does not pay. Add it to the refusal
   register so the next person does not have the same idea twice — several
@@ -106,7 +106,7 @@ earlier ones.
 - Use greedy `chat` text for anything touching the cache path. **`logits` does
   not read `--keep`** — only `main_serve` primes from a keep file — so a
   comparison taken through `logits` tests nothing there.
-- Where a change *does* move output, it is a **decision**: say so in
+- Where a change _does_ move output, it is a **decision**: say so in
   `CHANGES.md`, re-take the affected parity run, and expect the test that holds
   the old kernel bit-for-bit to fail deliberately.
 - A cache or store must never hand back rows for input the caller did not
@@ -120,7 +120,7 @@ earlier ones.
 - **Check that a new test bites.** Mutate the implementation it covers and
   confirm the test fails. Entries record this — dropping a flag from a recall
   failing two tests, removing the samples from an identity failing three.
-- Tests state *what the caller may rely on*, not what the code happens to do.
+- Tests state _what the caller may rely on_, not what the code happens to do.
   Name them as sentences.
 - The suite must pass on the default and `--tuned` builds; `--wide` must at
   least compile. `python run.py test --tuned`.
@@ -130,14 +130,14 @@ earlier ones.
 The documents are written to be read start to finish, and the voice is
 consistent across all of them. Match it.
 
-- **Plain words over jargon**, and concrete nouns: *a picture's rows*, *a clip*,
-  *the sweep*, *a run*, *what a token costs*. Not *artifacts*, *leveraging*,
-  *performant*.
+- **Plain words over jargon**, and concrete nouns: _a picture's rows_, _a clip_,
+  _the sweep_, _a run_, _what a token costs_. Not _artifacts_, _leveraging_,
+  _performant_.
 - **Say the number.** "18.96 ms of a 36.9 ms step — 52%" beats "a significant
   share". If there is no number, say there is none.
 - **Bold the claim, not the topic.** A bolded sentence should be the thing a
   reader must not miss.
-- Explain **why**, especially why something was *not* done. A comment that says
+- Explain **why**, especially why something was _not_ done. A comment that says
   what the code does is worth less than one saying what was tried instead.
 - Em dashes and semicolons are used freely; sentences may be long. British
   spelling. No emoji, no exclamation marks, no headings that promise more than
