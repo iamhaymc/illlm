@@ -14,12 +14,12 @@ re-sharded into three under the cap, with the index that names them — the
 ordinary Hugging Face layout, which both this engine and `transformers` read
 without being told. The re-shard is byte exact: every tensor's bytes were
 copied verbatim and only the offsets in each header were renumbered, so no
-value moved and no dtype was round-tripped. `bench/reshard.py --verify` hashes
-all 266 tensors in both copies and confirms they agree.
+value moved and no dtype was round-tripped. All 266 tensors were hashed in
+both copies and confirmed to agree.
 
 The upstream shards also ship no `model.safetensors.index.json` — the loader
-in this repository does not need one, but `transformers` does, so
-`bench/make_index.py` wrote it.
+in this repository does not need one, but `transformers` does, so it was
+generated from the safetensors headers and committed here.
 
 | file | what it holds |
 | ---- | ------------- |

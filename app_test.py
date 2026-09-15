@@ -11,9 +11,16 @@ Two modes:
               implementations over the same token ids, and compares logits.
               No download is needed, so it runs anywhere transformers does.
 
-  checkpoint  `--model PATH` points at a real checkpoint, for example
-              LiquidAI/LFM2.5-2.6B.  The same comparisons run against it, plus
-              a tokenizer agreement check over a corpus of awkward strings.
+  checkpoint  `--model PATH` points at a real checkpoint.  The default is the
+              `model/` folder at the repo root, which carries the published
+              LFM2.5-2.6B weights.  Against it the suite adds a tokenizer
+              agreement check, a throughput comparison -- the engine's `bench`
+              beside transformers doing the same shape of work at the same
+              weight width -- and a greedy continuation compared on the text,
+              judged against how far the reference parts from itself.
+
+              A missing checkpoint folder is a skip, not a failure: the
+              synthetic suite is the parity argument and runs without it.
 
 usage
   python3 app_test.py --binary ./build/app_main
@@ -24,10 +31,17 @@ usage
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+
+# The published checkpoint ships in the repository, so the checkpoint suite
+# runs by default; pass --model to point somewhere else, or --no-checkpoint to
+# skip it entirely.
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
 
 # ---------------------------------------------------------------------------
 # harness
@@ -68,12 +82,20 @@ def engine_rows(binary, model_dir, ids, vocab_size, *flags):
     return cells
 
 
+def load_kwargs(dtype):
+    """from_pretrained took torch_dtype before transformers 5 and dtype after."""
+    import transformers
+    key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    return {key: dtype}
+
+
 def reference(model_dir, ids, dtype=None):
     """Runs transformers over the same ids and returns every position's logits."""
     import torch
     from transformers import Lfm2ForCausalLM
 
-    model = Lfm2ForCausalLM.from_pretrained(model_dir, dtype=dtype or torch.float32).eval()
+    model = Lfm2ForCausalLM.from_pretrained(model_dir,
+                                            **load_kwargs(dtype or torch.float32)).eval()
     with torch.no_grad():
         out = model(input_ids=torch.tensor([ids]), use_cache=False).logits
     return out[0].float().numpy()
@@ -493,6 +515,181 @@ def check_checkpoint(binary, folder, filter_text):
 
 
 # ---------------------------------------------------------------------------
+# throughput and behaviour on a real checkpoint
+# ---------------------------------------------------------------------------
+
+# The engine is expected to be at least as fast as the reference doing the same
+# shape of work at the same weight width.  The comparison is like for like:
+# both sides run bf16, the same thread count, the same fill and step counts.
+# Quoting the engine's q8 against the reference's bf16 would fold a weight
+# width difference into what looks like an engine difference.
+FILL_TOKENS = 256
+STEP_TOKENS = 64
+
+
+def engine_bench(binary, folder, threads):
+    """Runs the engine's own bench verb and reads its rates back."""
+    cmd = [binary, "bench", "--model", folder, "--batch", str(FILL_TOKENS),
+           "--max-tokens", str(STEP_TOKENS), "--threads", str(threads), "--quiet"]
+    done = subprocess.run(cmd, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)}\n{done.stdout}\n{done.stderr}")
+    fill = step = 0.0
+    for line in done.stdout.splitlines():
+        hit = re.search(r"prefill\s+\d+ tok in [\d.]+ s -> ([\d.]+) tok/s", line)
+        if hit:
+            fill = float(hit.group(1))
+        hit = re.search(r"decode\s+\d+ tok in [\d.]+ s -> ([\d.]+) tok/s", line)
+        if hit:
+            step = float(hit.group(1))
+    return fill, step
+
+
+def reference_bench(folder, threads):
+    """Prefill and decode throughput of transformers on CPU, same shape of work.
+
+    One batch of FILL_TOKENS through the full model, then STEP_TOKENS
+    single-token steps with the key/value cache carried.  bf16, because that is
+    what the engine's as-stored path runs and what the checkpoint ships.
+    """
+    import torch
+    from transformers import Lfm2ForCausalLM
+
+    torch.set_grad_enabled(False)
+    torch.set_num_threads(threads)
+    model = Lfm2ForCausalLM.from_pretrained(folder,
+                                            **load_kwargs(torch.bfloat16),
+                                            local_files_only=True).eval()
+
+    ids = torch.arange(1, FILL_TOKENS + 1).unsqueeze(0)
+    mark = time.perf_counter()
+    out = model(input_ids=ids, use_cache=True)
+    fill = FILL_TOKENS / max(time.perf_counter() - mark, 1e-9)
+
+    past = out.past_key_values
+    mark = time.perf_counter()
+    for step in range(STEP_TOKENS):
+        out = model(input_ids=torch.tensor([[step % 1000 + 1]]),
+                    use_cache=True, past_key_values=past)
+        past = out.past_key_values
+    step = STEP_TOKENS / max(time.perf_counter() - mark, 1e-9)
+    del model, past
+    return fill, step
+
+
+def check_throughput(binary, folder, filter_text):
+    label = "checkpoint/throughput"
+    if filter_text and filter_text not in label:
+        return
+    announce(label, f"fill {FILL_TOKENS}, steps {STEP_TOKENS}, same width and threads")
+    threads = min(4, os.cpu_count() or 1)
+    mine_fill, mine_step = engine_bench(binary, folder, threads)
+    their_fill, their_step = reference_bench(folder, threads)
+    ok = mine_step >= their_step and mine_fill >= their_fill
+    record(label, ok,
+           f"engine prefill {mine_fill:.1f} tok/s, decode {mine_step:.1f} tok/s; "
+           f"reference prefill {their_fill:.1f}, decode {their_step:.1f}")
+
+
+def engine_generate(binary, folder, ids, steps):
+    """Greedy continuation from raw ids, returned as text."""
+    cmd = [binary, "generate", "--model", folder, "--raw",
+           "--tokens", ",".join(str(i) for i in ids),
+           "--max-tokens", str(steps), "--temp", "0", "--quiet"]
+    done = subprocess.run(cmd, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)}\n{done.stdout}\n{done.stderr}")
+    return done.stdout
+
+
+def reference_generate(folder, ids, steps, split=False):
+    """Greedy continuation from the same ids under transformers.
+
+    `split` primes the prompt one token at a time instead of one forward over
+    the whole prompt, which is the reference's own second summation order: the
+    two runs agree until float addition lands differently, and where they part
+    is how far agreement can be asked for.
+    """
+    import torch
+    from transformers import Lfm2ForCausalLM
+
+    model = Lfm2ForCausalLM.from_pretrained(folder,
+                                            **load_kwargs(torch.bfloat16),
+                                            local_files_only=True).eval()
+    with torch.no_grad():
+        if split:
+            past = None
+            for lead in range(len(ids)):
+                out = model(input_ids=torch.tensor([[ids[lead]]]),
+                            use_cache=True, past_key_values=past)
+                past = out.past_key_values
+            fresh = out.logits[0, -1].argmax().item()
+            fresh_list = [fresh]
+            for _ in range(steps - 1):
+                out = model(input_ids=torch.tensor([[fresh]]),
+                            use_cache=True, past_key_values=past)
+                past = out.past_key_values
+                fresh = out.logits[0, -1].argmax().item()
+                fresh_list.append(fresh)
+            del model, past
+            return fresh_list
+        out = model.generate(input_ids=torch.tensor([ids]),
+                             max_new_tokens=steps, do_sample=False, use_cache=True)
+    del model
+    return out[0].tolist()
+
+
+def shared_prefix(left, right):
+    """How many leading tokens two id sequences have in common."""
+    span = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        span += 1
+    return span
+
+
+def check_greedy(binary, folder, filter_text):
+    """Greedy continuations, compared on the shared prefix of decoded text.
+
+    The bar is measured, not assumed: the reference is run against itself,
+    primed one token at a time against one forward over the whole prompt, and
+    where those two part is how far agreement can be asked for.  The engine is
+    allowed to follow half as far as the reference follows itself before it is
+    called wrong.  Whether a rounding lands on a half step is a lottery, so
+    what the reference draws on one prompt is an estimate and not a bound.
+    """
+    label = "checkpoint/greedy"
+    if filter_text and filter_text not in label:
+        return
+    announce(label, "greedy continuations, shared prefix against the reference's own")
+    text = "The Liquid architecture interleaves attention with short convolutions because"
+    done = subprocess.run([binary, "tokens", "--model", folder, "--prompt", text, "--quiet"],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        record(label, False, done.stderr.strip())
+        return
+    ids = [int(x) for x in done.stdout.splitlines()[0].split(",")]
+
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(folder, local_files_only=True)
+
+    def decode(these):
+        return tok.decode(these, skip_special_tokens=True).strip()
+
+    mine = decode(reference_generate(folder, ids, STEP_TOKENS))
+    theirs = decode(reference_generate(folder, ids, STEP_TOKENS, split=True))
+    my_text = engine_generate(binary, folder, ids, STEP_TOKENS).strip()
+
+    my_share = shared_prefix(my_text, theirs)
+    their_share = shared_prefix(mine, theirs)
+    ok = my_share * 2.0 >= their_share
+    record(label, ok,
+           f"engine follows for {my_share} characters, the reference itself for "
+           f"{their_share}: {my_text[:60]!r}")
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -501,11 +698,18 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", default="./build/app_main",
                         help="path to the compiled CLI (default ./build/app_main)")
-    parser.add_argument("--model", default=None,
-                        help="a real checkpoint folder to test against as well")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="checkpoint folder to test against (default ./model)")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="skip the checkpoint suite even when ./model exists")
     parser.add_argument("--filter", default=None, help="only run checks whose name contains this")
     parser.add_argument("--keep", action="store_true", help="keep the synthetic checkpoints")
     args = parser.parse_args()
+
+    # The corpus and the continuations carry text outside any Windows console
+    # code page.  Report what cannot be encoded rather than dying mid-run.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -547,9 +751,16 @@ def main():
         print("\nvocabulary")
         check_tokenizer(args.binary, root, args.filter)
         check_roundtrip(args.binary, root, args.filter)
-        if args.model:
-            print("\ncheckpoint")
+        if args.no_checkpoint:
+            print("\ncheckpoint  skipped (--no-checkpoint)")
+        elif not os.path.isdir(args.model):
+            print(f"\ncheckpoint  skipped: {args.model} not found "
+                  f"(pass --model or --no-checkpoint)")
+        else:
+            print(f"\ncheckpoint  {args.model}")
             check_checkpoint(args.binary, args.model, args.filter)
+            check_throughput(args.binary, args.model, args.filter)
+            check_greedy(args.binary, args.model, args.filter)
     finally:
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)
