@@ -1,4 +1,4 @@
-# illlm
+# INFERLIQU
 
 An inference engine for the Liquid language architecture, written in pure C
 with no dependencies.
