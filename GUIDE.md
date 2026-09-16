@@ -24,7 +24,7 @@ Five source files, flat, no build system, plus the published checkpoints in
 | --- | --- | --- |
 | `app/core.c` | ~4500 | the engine: a header and its implementation in one file |
 | `app/main.c` | ~670 | the command line, six verbs |
-| `test/test.c` | ~800 | unit tests over the engine internals |
+| `test/test.c` | ~840 | unit tests over the engine internals |
 | `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
 | `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
@@ -250,6 +250,24 @@ acc = fma( cvt_f32(madd_i16(w_block, a_block)), scale_w * scale_a, acc )
 That leaves exactly one horizontal reduction per output row. On AVX-512BW a
 32-value block widens to precisely one register of int16, so a block costs a
 single multiply-add.
+
+Where VNNI is present the loop takes blocks in pairs instead, because two
+blocks are 64 bytes and that is one 512 bit register whole:
+
+```
+acc = fma( cvt_f32(dpbusd(|w_pair|, a_pair * sign(w_pair))),
+           [scale_lo x8, scale_hi x8], acc )
+```
+
+`vpdpbusd` folds four byte products into a lane against `vpmaddwd`'s two, and
+it reads bytes directly, so the two widenings disappear as well — which on a
+host bound by instruction issue is the larger half of the saving. Its left
+operand is unsigned, so the weights go in as magnitudes and their sign moves
+onto the activations; AVX-512 has no `vpsignb`, so that move is `vpmovb2m` and
+a masked negate. Lanes 0..7 then carry the low block and lanes 8..15 the high
+one, which is why the scale goes in as a vector of two halves rather than a
+broadcast. Everything without VNNI folds the pair back into two single block
+steps in the same order, so only a VNNI build's output moves.
 
 ### part 6 — json reader
 
@@ -504,20 +522,25 @@ why q8 nearly doubles it and why threads help until bandwidth saturates.
 Prefill is arithmetic bound. `2 * parameters * tokens` FLOPs, and the tile in
 `dense` decides how close to peak you get.
 
-On the 2.9B synthetic checkpoint, four cores, AVX-512:
+On the published 2.6B checkpoint at q8, four cores at 2.80 GHz, AVX-512 with
+VNNI — the `xeon-2.8` host in `CHANGES.md`'s standing results:
 
-| | weights | prefill | decode |
+| | weights | prefill, 256 tok | decode |
 | --- | --- | --- | --- |
-| bf16 | 5.44 GiB | 38.0 tok/s | 5.2 tok/s |
-| q8 | 3.06 GiB | 37.1 tok/s | 9.0 tok/s |
+| q8 | 2.83 GiB | 32.6 tok/s | 10.7 tok/s |
 
-Roughly 53 GB/s of effective weight traffic in prefill and 28 GB/s in decode,
-and about 230 GFLOP/s — both near what four cores of this class sustain. Decode
-scales 2.4 → 4.6 → 8.9 tok/s over one, two, and four threads.
+Decode there is 32.5 GB/s of weight traffic against a 36.6 GB/s bare memory
+sweep — 89% of what the host can fetch, so the decode kernel has about a tenth
+left in it and everything after that has to read fewer bytes or produce more
+than one token per read. Prefill is 88 G multiply-adds a second and is bound by
+instruction issue, not by memory: its weight stream is well under the sweep.
 
 If you are profiling a change, the order of what to look at is: the `dense`
 inner loop, then the attention score loop at long context, then everything else
-together.
+together. In q8 the inner loop is `ill_q8_pair`, which takes two 32-value
+blocks at once because that is one 512 bit register; `ill_q8_step` is the
+single block form it falls back to for an odd trailing block and on
+instruction sets without VNNI.
 
 ---
 

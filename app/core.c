@@ -1166,6 +1166,54 @@ static inline IllQAcc ill_q8_step(IllQAcc acc, const int8_t *w, const int8_t *a,
 }
 #endif
 
+/* -- q8 dot, two blocks at a time ------------------------------------------
+ *
+ * Two blocks are 64 bytes, which is one 512 bit register, and `vpdpbusd`
+ * folds four byte products into each of its sixteen int32 lanes against
+ * `vpmaddwd`'s two.  That halves the work of the multiply and, more to the
+ * point on a machine that is issue bound rather than memory bound here, it
+ * halves the widening that feeds it: the byte-to-int16 conversions disappear
+ * entirely.  Lanes 0..7 then hold the low block's products and lanes 8..15
+ * the high block's, so the two scales go in as one vector with eight lanes of
+ * each.
+ *
+ * `vpdpbusd` reads its left operand as unsigned, so the weights go in as
+ * magnitudes and their sign moves onto the activations.  A weight of -128
+ * still works -- its magnitude is 128, which is what an unsigned byte is for
+ * -- and the activation side cannot overflow because `ill_q8_pack` clamps
+ * both sides to -127..127.
+ *
+ * Every other instruction set folds the pair back into two single-block
+ * steps, in that order, so nothing outside a VNNI build moves.
+ * ------------------------------------------------------------------------*/
+
+#if defined(ILL_ARCH_X86) && defined(__AVX512VNNI__) && defined(__AVX512BW__) && \
+    defined(__AVX512F__) && !defined(ILL_NO_SIMD)
+#define ILL_Q8_PAIR 1
+static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
+                                  float lo, float hi)
+{
+    __m512i wv  = _mm512_loadu_si512((const void *)w);
+    __m512i av  = _mm512_loadu_si512((const void *)a);
+    __mmask64 neg = _mm512_movepi8_mask(wv);               /* where w is negative */
+    __m512i mag = _mm512_abs_epi8(wv);                     /* |w|, read unsigned  */
+    __m512i sgn = _mm512_mask_sub_epi8(av, neg, _mm512_setzero_si512(), av);
+    __m512i tot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), mag, sgn);
+    __m512  sv  = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(lo)),
+                                     _mm256_set1_ps(hi), 1);
+    return _mm512_fmadd_ps(_mm512_cvtepi32_ps(tot), sv, acc);
+}
+#endif
+
+#if !defined(ILL_Q8_PAIR)
+static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
+                                  float lo, float hi)
+{
+    acc = ill_q8_step(acc, w, a, lo);
+    return ill_q8_step(acc, w + ILL_Q8_BLOCK, a + ILL_Q8_BLOCK, hi);
+}
+#endif
+
 /* ============================================================================
  * part 6 -- json reader
  *
@@ -1807,7 +1855,7 @@ typedef struct IllPlane {
  * registers.
  * ------------------------------------------------------------------------*/
 
-#define ILL_TILE_MAX 4
+#define ILL_TILE_MAX 8
 
 #define ILL_DENSE_BODY(N, LOADW, CTYPE, CASTW)                                        \
     do {                                                                              \
@@ -1855,7 +1903,11 @@ static void ill_dense_real(const IllPlane *plane, const float *x, size_t xstep,
         case 1:  ILL_DENSE_TYPED(1); break;
         case 2:  ILL_DENSE_TYPED(2); break;
         case 3:  ILL_DENSE_TYPED(3); break;
-        default: ILL_DENSE_TYPED(4); break;
+        case 4:  ILL_DENSE_TYPED(4); break;
+        case 5:  ILL_DENSE_TYPED(5); break;
+        case 6:  ILL_DENSE_TYPED(6); break;
+        case 7:  ILL_DENSE_TYPED(7); break;
+        default: ILL_DENSE_TYPED(8); break;
     }
 }
 
@@ -1868,7 +1920,15 @@ static void ill_dense_real(const IllPlane *plane, const float *x, size_t xstep,
             IllQAcc acc[N];                                                           \
             int32_t t, b;                                                             \
             for (t = 0; t < N; ++t) acc[t] = ill_q8_zero();                           \
-            for (b = 0; b + 1 <= full; ++b) {                                         \
+            for (b = 0; b + 2 <= full; b += 2) {                                      \
+                const int8_t *wb = w + (size_t)b * ILL_Q8_BLOCK;                      \
+                for (t = 0; t < N; ++t)                                               \
+                    acc[t] = ill_q8_pair(acc[t],                                      \
+                                wb, xq + (size_t)t * qstep + (size_t)b * ILL_Q8_BLOCK, \
+                                ws[b] * xs[(size_t)t * sstep + b],                    \
+                                ws[b + 1] * xs[(size_t)t * sstep + b + 1]);           \
+            }                                                                         \
+            for (; b < full; ++b) {                                                   \
                 const int8_t *wb = w + (size_t)b * ILL_Q8_BLOCK;                      \
                 for (t = 0; t < N; ++t)                                               \
                     acc[t] = ill_q8_step(acc[t],                                      \
@@ -1902,7 +1962,11 @@ static void ill_dense_byte(const IllPlane *plane, const int8_t *xq, size_t qstep
         case 1:  ILL_DENSE_Q8_BODY(1); break;
         case 2:  ILL_DENSE_Q8_BODY(2); break;
         case 3:  ILL_DENSE_Q8_BODY(3); break;
-        default: ILL_DENSE_Q8_BODY(4); break;
+        case 4:  ILL_DENSE_Q8_BODY(4); break;
+        case 5:  ILL_DENSE_Q8_BODY(5); break;
+        case 6:  ILL_DENSE_Q8_BODY(6); break;
+        case 7:  ILL_DENSE_Q8_BODY(7); break;
+        default: ILL_DENSE_Q8_BODY(8); break;
     }
 }
 

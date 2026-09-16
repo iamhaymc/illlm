@@ -98,23 +98,37 @@ and biased convolution kernels; f32, f16, and bf16 storage; chunked prefill and
 single token decode; and tokenizer agreement over a corpus of awkward strings.
 
 Against float32 checkpoints the engine matches the reference to **2e-7
-relative**, which is float32 rounding. `test/test.c` adds 73 unit checks over the
+relative**, which is float32 rounding. `test/test.c` adds 86 unit checks over the
 internals. Both suites run clean under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Comparison
 
+The published `LiquidAI/LFM2.5-2.6B` checkpoint — 30 layers, 8 attention and 22
+convolution, model dim 2048, feed forward 10752, 32 query heads over 8
+key-value heads, vocabulary 128000 — on four x86-64 cores at 2.80 GHz with
+AVX-512 and VNNI, at q8:
+
+|         | weights  | prefill, 256 tok | decode    |
+| ------- | -------- | ---------------- | --------- |
+| q8      | 2.83 GiB | 32.6 tok/s       | 10.7 tok/s |
+
+Decode on that host is 32.5 GB/s of weight traffic against a 36.6 GB/s bare
+memory sweep, which is 89% of what the machine can fetch — decode is the memory
+and there is little left in the kernel. Prefill is arithmetic bound and sits at
+88 G multiply-adds a second.
+
 A synthetic 2.9B-parameter checkpoint of LFM2-2.6B proportions — 32 layers,
-model dim 2560, feed forward 8192, 32 query heads over 8 key-value heads,
-vocabulary 65536 — on four x86-64 cores with AVX-512:
+model dim 2560, feed forward 8192, vocabulary 65536 — on an earlier four-core
+AVX-512 host, before the paired dot:
 
 |                      | weights  | prefill    | decode    |
 | -------------------- | -------- | ---------- | --------- |
 | bf16, as stored      | 5.44 GiB | 38.0 tok/s | 5.2 tok/s |
 | q8, repacked at load | 3.06 GiB | 37.1 tok/s | 9.0 tok/s |
 
-Decode scales 2.4 → 4.6 → 8.9 tok/s across one, two, and four threads. Loading
-bf16 costs about a tenth of a second because the weights are memory mapped and
-never copied; repacking to q8 costs about three seconds once.
+Decode scaled 2.4 → 4.6 → 8.9 tok/s across one, two, and four threads there.
+Loading bf16 costs about a tenth of a second because the weights are memory
+mapped and never copied; repacking to q8 costs a few seconds once.
 
 ## FINETUNE
 

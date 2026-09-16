@@ -232,7 +232,8 @@ static void test_json(void)
 
 #define TEST_ROWS 37
 #define TEST_COLS 71
-#define TEST_TOKS 5
+#define TEST_TOKS (ILL_TILE_MAX + 1)   /* one past the widest tile, so a
+                                              partial tile is covered too */
 
 static void test_dense_naive(const float *w, const float *x, float *y,
                              int32_t rows, int32_t cols, int32_t tokens)
@@ -271,12 +272,15 @@ static void test_kernels(void)
               test_gap(want, got, TEST_ROWS) < 1e-5f, "%.1e",
               (double)test_gap(want, got, TEST_ROWS));
 
+    /* Every tile width the dispatch instantiates, not only the widest: a
+       missing case in the switch computes the first four rows and leaves the
+       rest of the tile at whatever the buffer held. */
     for (tile = 2; tile <= ILL_TILE_MAX; ++tile) {
+        char name[48];
         memset(got, 0, TEST_TOKS * TEST_ROWS * sizeof(float));
         ill_dense_real(&plane, x, TEST_COLS, tile, 0, TEST_ROWS, got, TEST_ROWS);
-        test_case(tile == 2 ? "f32 dense, two token tile" :
-                  tile == 3 ? "f32 dense, three token tile" : "f32 dense, four token tile",
-                  test_gap(want, got, tile * TEST_ROWS) < 1e-5f, "%.1e",
+        snprintf(name, sizeof name, "f32 dense, %d token tile", tile);
+        test_case(name, test_gap(want, got, tile * TEST_ROWS) < 1e-5f, "%.1e",
                   (double)test_gap(want, got, tile * TEST_ROWS));
     }
 
@@ -319,14 +323,47 @@ static void test_kernels(void)
                         xq + (size_t)index * TEST_COLS, xs + (size_t)index * blocks);
         plane.cells = wq; plane.steps = ws; plane.type = ILL_TYPE_Q8; plane.blocks = blocks;
         for (tile = 1; tile <= ILL_TILE_MAX; ++tile) {
+            char name[48];
             memset(got, 0, TEST_TOKS * TEST_ROWS * sizeof(float));
             ill_dense_byte(&plane, xq, TEST_COLS, xs, blocks, tile, 0, TEST_ROWS,
                            got, TEST_ROWS);
-            if (tile == ILL_TILE_MAX)
-                test_case("q8 dense tracks f32",
-                          test_gap(want, got, tile * TEST_ROWS) < 0.05f, "%.1e",
-                          (double)test_gap(want, got, tile * TEST_ROWS));
+            snprintf(name, sizeof name, "q8 dense tracks f32, %d token tile", tile);
+            test_case(name, test_gap(want, got, tile * TEST_ROWS) < 0.05f, "%.1e",
+                      (double)test_gap(want, got, tile * TEST_ROWS));
         }
+        {   /* The paired dot must be the two single block dots it stands
+               for.  On a VNNI build it is a different instruction reading the
+               weights unsigned, so this is the check that the sign moved onto
+               the activations correctly; everywhere else it is the identity. */
+            IllQAcc one = ill_q8_zero(), two = ill_q8_zero();
+            float lo = 0.5f, hi = 0.25f, a, b;
+            one = ill_q8_step(one, wq, xq, lo);
+            one = ill_q8_step(one, wq + ILL_Q8_BLOCK, xq + ILL_Q8_BLOCK, hi);
+            two = ill_q8_pair(two, wq, xq, lo, hi);
+            a = ill_q8_fold(one); b = ill_q8_fold(two);
+            test_case("q8 paired dot equals two single dots",
+                      test_near(a, b, 1e-3f), "%.6f vs %.6f", (double)a, (double)b);
+        }
+
+        {   /* A weight of -128 is the one value whose magnitude does not fit a
+               signed byte; the unsigned left operand of the paired dot is what
+               makes it work, so say so here rather than trusting it. */
+            int8_t wedge[2 * ILL_Q8_BLOCK], edge[2 * ILL_Q8_BLOCK];
+            IllQAcc one = ill_q8_zero(), two = ill_q8_zero();
+            float a, b;
+            int32_t k;
+            for (k = 0; k < 2 * ILL_Q8_BLOCK; ++k) {
+                wedge[k] = (int8_t)(k % 3 == 0 ? -128 : (k % 5) - 2);
+                edge[k]  = (int8_t)((k % 7) - 3);
+            }
+            one = ill_q8_step(one, wedge, edge, 1.0f);
+            one = ill_q8_step(one, wedge + ILL_Q8_BLOCK, edge + ILL_Q8_BLOCK, 1.0f);
+            two = ill_q8_pair(two, wedge, edge, 1.0f, 1.0f);
+            a = ill_q8_fold(one); b = ill_q8_fold(two);
+            test_case("q8 paired dot handles a -128 weight",
+                      test_near(a, b, 1e-3f), "%.1f vs %.1f", (double)a, (double)b);
+        }
+
         {
             float row[TEST_COLS];
             ill_plane_row(&plane, 3, row);
