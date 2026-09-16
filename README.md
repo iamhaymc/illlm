@@ -12,13 +12,13 @@ A fast and tiny engine for agents.
 It offers utilities related to:
 inference, encoding, extraction, vision, speech
 
+It is written in pure and optimized C11,
+cross-platform, and designed for acceleration.
+
 It supports Huggingface checkpoints for:
 - LFM2.5 multi-modal architecture
 - Gemma4 multi-modal architecture
 - YOLO26 vision architecture
-
-It is written in pure and optimized C11,
-cross-platform, and designed for acceleration.
 
 ## ↘️✴️ QUICKSTART
 
