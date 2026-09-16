@@ -40,6 +40,22 @@ for the engine to run correctly today.
   anchor term is exactly zero at initialisation and the `--check` pass runs --
   but no tune has been taken over the 2.6B weights, so there is no number for
   what the register costs in accuracy. It needs a card, not a change.
+- Run the abliteration against the published weights. **Blocked**: the drive in
+  `app_tune.py` is verified end to end on a synthetic four layer Liquid
+  checkpoint carrying the real tokenizer and chat template over the real 128000
+  entry vocabulary -- heretic reaches eight modules over the four blocks, the
+  settings arrive as heretic parses them, a two trial search exports the trial
+  the cap allows, the saved folder carries the template and the generation
+  defaults and the engine reads it, an interrupted or finished study resumes
+  from `build/tune/uncensor-study` rather than starting again, and
+  `--uncensor --train --merge` in one command trains the adapter over the
+  decensored weights -- but no abliteration has been taken over the 2.6B
+  weights, because the search costs a hundred generations and a hundred forward
+  passes per trial over two hundred trials, which is a card's work and not a
+  processor's. What is missing is the pair of numbers that says what it bought
+  and what it cost: refusals on the held out harmful prompts beside the base's,
+  and a `--check` afterwards to say whether the register and the answers
+  survived the edit. It needs a card, not a change.
 - Grow `data_tune.jsonl` past its 202 hand written rows with `--make-data`
   against a published reasoning corpus. The press is deletion only and takes
   about 29% off the prose it is given, which is the floor rather than the
