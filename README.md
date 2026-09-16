@@ -15,7 +15,10 @@ app_test.c    unit tests for the engine internals
 app_test.py   comparison against the reference implementation
 app_tune.py   fine tuning on the reference side, the caveman rule engine,
               and the heretic abliteration pass
+app_eval.py   the benchmark harness: lighteval's eval backend, scoring the
+              engine itself, and the chart it draws
 datasets/data_tune.jsonl  the tuning corpus, 202 rows
+pyproject.toml  what the reference side needs; the engine still needs nothing
 run.py        workflows: install, build, test, run
 model/        the published LFM2.5-2.6B checkpoint, used by the test suite
 GUIDE.md      a tour of how it all works
@@ -176,6 +179,72 @@ heretic balances its two objectives at follows the export cap, so the search
 spends its trials in the band a trial can be taken from. No abliteration has
 been run over the 2.6B weights yet — that needs a card, and `TODO.md` carries
 the item.
+
+## Benchmarks
+
+`app_eval.py` scores a checkpoint on nine public benchmarks, and the thing it
+scores is **this engine**: `build/app_main generate` is registered with
+inspect-ai as a model provider, so every sample is a run of the C engine over
+the checkpoint rather than of `transformers` over the same weights. The tasks
+themselves are [lighteval](https://github.com/huggingface/lighteval)'s, run
+through its eval backend — the inspect-ai one, `lighteval eval` on the command
+line — which is the only part of this that needs installing:
+
+```sh
+pip install -e .                                  # lighteval and langdetect
+python3 app_eval.py --model model                 # the nine benchmarks
+python3 app_eval.py --model model --samples 200   # a longer run
+python3 app_eval.py --tasks ifeval,boolq --model model
+python3 app_eval.py --model model --rival hf-inference-providers/Qwen/Qwen3-4B
+python3 app_eval.py --chart                       # redraw from the last results
+```
+
+| benchmark | task | what it asks |
+| --- | --- | --- |
+| IFBench | `ifbench_test` | held out instruction following constraints |
+| IFEval | `ifeval` | verifiable instruction following |
+| Long Horizon Execution | generated | executing a plan of growing length |
+| MMLU Pro | `mmlu_pro` | ten choice knowledge and reasoning |
+| MuSR | `musr` | multi step soft reasoning, three subsets |
+| SimpleQA | `simpleqa` | short fact seeking questions, model graded |
+| AGIEval | `agieval` | human exam questions, seventeen subsets |
+| bAbI QA | `babi_qa` | synthetic reading comprehension |
+| BoolQ | `boolq` | yes or no reading comprehension |
+
+It writes `build/eval/results.json`, a markdown table beside it, an SVG chart
+that reads in a light or a dark theme, and the inspect-ai log set, which
+`inspect view --log-dir build/eval/logs` opens sample by sample. The chart
+carries a bar per benchmark per model, and a second panel for the long horizon
+task: accuracy against the number of steps in the plan, which is the shape that
+benchmark exists to show.
+
+Two of the nine need more than the backend has. **bAbI QA** ships in lighteval
+without its inspect-ai half — no `sample_fields`, no scorer, and a prompt
+function that decodes every answer as a compass path and so raises on the
+subset the task selects — and `app_eval.py` supplies all of it. **Long Horizon
+Execution** is not in lighteval at any version, so it is generated: a seeded
+dictionary, a plan of N lookups over it, and one answer that is the values
+concatenated in plan order, after the benchmark in "The Illusion of
+Diminishing Returns: Measuring Long Horizon Execution in LLMs". It is **not
+the paper's data**, it is
+written `Long Horizon Execution (generated)` wherever it is reported, and a
+score on it compares with another run of this script rather than with a
+published number.
+
+LFM2.5 reasons before it answers, so the provider splits each reply at
+`</think>` and hands the scorers the answer with the reasoning kept beside it
+in the log; a reply that never closes the block is scored whole, because that
+run hit the token cap and hiding it would flatter the model. Replies are
+cached, keyed by the prompt and by a stamp of the weights, the binary and the
+quantisation, so a retuned checkpoint at the same path is never served the
+replies of the one before it.
+
+**No run against the published weights has been taken yet**, so there are no
+numbers here to quote: `--samples` defaults to 25, which is a smoke test, and a
+2.6B checkpoint on CPU answers a few hundred samples an hour. Whatever cap a
+run used is written into `results.json` and printed under both the table and
+the chart, because a score without its sample count is not a number anyone can
+use.
 
 ## Extending it to an accelerator
 
