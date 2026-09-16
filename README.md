@@ -7,10 +7,17 @@
 </tbody>
 </table>
 
-An inference engine for the Liquid language architecture,
-written without dependencies in pure and optimized C11.
+A fast and tiny engine for agents.
 
-It runs Hugging Face checkpoints directly (included in the repository).
+It implements methodology related to
+inference, encoding, extraction, vision, speech
+
+It supports Huggingface checkpoints for:
+- LFM2.5 model architecture
+- Gemma4 model architecture
+- YOLO26 model architecture
+
+Written in pure and optimized C11.
 
 ## ↘️✴️ QUICKSTART
 
