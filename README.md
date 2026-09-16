@@ -18,6 +18,7 @@ It supports Huggingface checkpoints for:
 - YOLO26 model architecture
 
 Written in pure and optimized C11.
+Designed to easily swap accelerators.
 
 ## ↘️✴️ QUICKSTART
 
