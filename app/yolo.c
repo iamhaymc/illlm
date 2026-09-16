@@ -3555,6 +3555,138 @@ static YoloStatus yolo_pixels_scale(const uint8_t *source, int source_width,
     return YOLO_OK;
 }
 
+/* Pillow's resize, which is what a classifier's shaping goes through and is
+ * not the same algorithm as OpenCV's.
+ *
+ * `torchvision.transforms.Resize` on a PIL picture calls Pillow, and Pillow
+ * antialiases: shrinking by a factor of five, it weighs a five-wide window of
+ * source pixels rather than the two nearest, so a classifier sees a picture
+ * that has been averaged down rather than sampled down.  Using the two-tap
+ * resize here instead puts the right label on bus.jpg with the wrong
+ * confidence -- 0.77 where the reference says 0.52 -- because the aliasing it
+ * leaves behind is exactly the high-frequency detail a classifier reads.
+ *
+ * Two passes, horizontal then vertical, through an intermediate of bytes, with
+ * the weights in twenty-two-bit fixed point, as Pillow does it. */
+
+#define YOLO_PIL_BITS 22
+
+static int yolo_pil_taps(int in_size, int out_size, int **bound_out,
+                         int **weight_out, int *span_out)
+{
+    double scale = (double)in_size / (double)out_size;
+    double filter_scale = scale < 1.0 ? 1.0 : scale;
+    double support = filter_scale;          /* the bilinear filter's is one */
+    int span = (int)ceil(support) * 2 + 1;
+    int *bound_list = (int *)malloc((size_t)out_size * 2 * sizeof(int));
+    int *weight_list = (int *)calloc((size_t)out_size * (size_t)span, sizeof(int));
+    double *room = (double *)malloc((size_t)span * sizeof(double));
+    int index, step;
+
+    if (!bound_list || !weight_list || !room) {
+        free(bound_list); free(weight_list); free(room);
+        return 0;
+    }
+    for (index = 0; index < out_size; index++) {
+        double center = ((double)index + 0.5) * scale;
+        double step_scale = 1.0 / filter_scale;
+        double total = 0.0;
+        int first = (int)(center - support + 0.5);
+        int last = (int)(center + support + 0.5);
+        if (first < 0) first = 0;
+        if (last > in_size) last = in_size;
+        last -= first;
+        for (step = 0; step < last; step++) {
+            double at = ((double)(step + first) - center + 0.5) * step_scale;
+            double weight = at < 0.0 ? -at : at;
+            room[step] = weight < 1.0 ? 1.0 - weight : 0.0;
+            total += room[step];
+        }
+        for (step = 0; step < last; step++) {
+            double weight = total != 0.0 ? room[step] / total : 0.0;
+            weight_list[index * span + step] =
+                (int)(weight < 0.0 ? weight * (1 << YOLO_PIL_BITS) - 0.5
+                                   : weight * (1 << YOLO_PIL_BITS) + 0.5);
+        }
+        bound_list[index * 2] = first;
+        bound_list[index * 2 + 1] = last;
+    }
+    free(room);
+    *bound_out = bound_list;
+    *weight_out = weight_list;
+    *span_out = span;
+    return 1;
+}
+
+static uint8_t yolo_pil_clip(int value)
+{
+    int byte = value >> YOLO_PIL_BITS;
+    if (byte < 0) return 0;
+    if (byte > 255) return 255;
+    return (uint8_t)byte;
+}
+
+/* `source` is `channel_count` bytes a pixel; `target` is always three, in the
+ * order the caller asked for. */
+static YoloStatus yolo_pixels_shrink(const uint8_t *source, int source_width,
+                                     int source_height, int source_step,
+                                     int channel_count, int bgr_flag,
+                                     uint8_t *target, int target_width,
+                                     int target_height)
+{
+    int *bound_list = NULL, *weight_list = NULL, span = 0;
+    uint8_t *middle;
+    int row, column, channel, step;
+
+    middle = (uint8_t *)malloc((size_t)target_width * (size_t)source_height * 3);
+    if (!middle) return YOLO_ERR_MEMORY;
+
+    if (!yolo_pil_taps(source_width, target_width, &bound_list, &weight_list, &span)) {
+        free(middle);
+        return YOLO_ERR_MEMORY;
+    }
+    for (row = 0; row < source_height; row++) {
+        const uint8_t *source_row = source + (size_t)row * (size_t)source_step;
+        uint8_t *middle_row = middle + (size_t)row * (size_t)target_width * 3;
+        for (column = 0; column < target_width; column++) {
+            int first = bound_list[column * 2], last = bound_list[column * 2 + 1];
+            const int *weight = weight_list + column * span;
+            for (channel = 0; channel < 3; channel++) {
+                int take = channel_count == 1 ? 0 : (bgr_flag ? 2 - channel : channel);
+                int total = 1 << (YOLO_PIL_BITS - 1);
+                for (step = 0; step < last; step++)
+                    total += (int)source_row[(first + step) * channel_count + take]
+                           * weight[step];
+                middle_row[column * 3 + channel] = yolo_pil_clip(total);
+            }
+        }
+    }
+    free(bound_list); free(weight_list);
+
+    if (!yolo_pil_taps(source_height, target_height, &bound_list, &weight_list, &span)) {
+        free(middle);
+        return YOLO_ERR_MEMORY;
+    }
+    for (row = 0; row < target_height; row++) {
+        int first = bound_list[row * 2], last = bound_list[row * 2 + 1];
+        const int *weight = weight_list + row * span;
+        uint8_t *target_row = target + (size_t)row * (size_t)target_width * 3;
+        for (column = 0; column < target_width; column++) {
+            for (channel = 0; channel < 3; channel++) {
+                int total = 1 << (YOLO_PIL_BITS - 1);
+                for (step = 0; step < last; step++)
+                    total += (int)middle[((size_t)(first + step) * (size_t)target_width
+                                          + (size_t)column) * 3 + channel]
+                           * weight[step];
+                target_row[column * 3 + channel] = yolo_pil_clip(total);
+            }
+        }
+    }
+    free(bound_list); free(weight_list);
+    free(middle);
+    return YOLO_OK;
+}
+
 static void yolo_frame_fit(const YoloImage *image, int size, int stride_size,
                            int rect_flag, int scale_up_flag, int center_flag,
                            YoloFrame *frame, int *width_out, int *height_out)
@@ -3917,10 +4049,20 @@ static float yolo_rbox_overlap(const YoloPick *a, const YoloPick *b)
     return yolo_clamp_float(overlap, 0.0f, 1.0f);
 }
 
-/* Greedy suppression, highest score first.  Boxes of different classes never
- * suppress each other unless the caller asked for that; the reference does it
- * by shifting each class's boxes far apart on the plane, which this does by
- * comparing the class instead -- the same answer without the magic offset. */
+/* Suppression, highest score first.  Boxes of different classes never suppress
+ * each other unless the caller asked for that; the reference does it by
+ * shifting each class's boxes far apart on the plane, which this does by
+ * comparing the class instead -- the same answer without the magic offset.
+ *
+ * The two shapes of box are suppressed by two different rules, because the
+ * reference suppresses them with two different pieces of code and they do not
+ * agree.  An axis-aligned box goes through torchvision's greedy pass: a box
+ * that has been struck out stops striking anything else.  An oriented box goes
+ * through the matrix pass, where a box is struck if *any* higher scoring box
+ * overlaps it, struck or not -- so a middle box can take a third box down with
+ * it after being taken down itself.  On the obb checkpoint that is the
+ * difference between reporting two boxes and reporting one.  The thresholds
+ * differ too: greedy strikes above the limit, the matrix at or above it. */
 static int yolo_suppress(YoloPick *pick_list, int count, float overlap_limit,
                          int class_blind_flag, int rotated_flag, int keep_limit)
 {
@@ -3930,9 +4072,8 @@ static int yolo_suppress(YoloPick *pick_list, int count, float overlap_limit,
     if (count <= 0) return 0;
     dead_list = (int *)calloc((size_t)count, sizeof(int));
     if (!dead_list) return count;
-    for (index = 0; index < count && kept < keep_limit; index++) {
-        if (dead_list[index]) continue;
-        pick_list[kept++] = pick_list[index];
+    for (index = 0; index < count; index++) {
+        if (dead_list[index] && !rotated_flag) continue;
         for (other = index + 1; other < count; other++) {
             float overlap;
             if (dead_list[other]) continue;
@@ -3942,9 +4083,12 @@ static int yolo_suppress(YoloPick *pick_list, int count, float overlap_limit,
             overlap = rotated_flag
                     ? yolo_rbox_overlap(&pick_list[index], &pick_list[other])
                     : yolo_overlap(&pick_list[index], &pick_list[other]);
-            if (overlap > overlap_limit) dead_list[other] = 1;
+            if (rotated_flag ? overlap >= overlap_limit : overlap > overlap_limit)
+                dead_list[other] = 1;
         }
     }
+    for (index = 0; index < count && kept < keep_limit; index++)
+        if (!dead_list[index]) pick_list[kept++] = pick_list[index];
     free(dead_list);
     return kept;
 }
@@ -4073,45 +4217,49 @@ static YoloStatus yolo_session_shape(YoloSession *session, const YoloImage *imag
     size_t index, count;
 
     if (session->model->task == YOLO_TASK_CLASSIFY) {
-        /* a classifier shrinks the short side to the input and takes the
-         * middle square, so the picture is not squeezed and nothing is padded */
+        /* the reference shrinks the short side to the input and takes the
+         * middle square, so nothing is squeezed and nothing is padded.  The
+         * long side is truncated, not rounded, which is what torchvision's
+         * `int(size * long / short)` does and is a pixel either way. */
         int size = session->input_width;
         int short_side = yolo_min_int(image->width, image->height);
-        float ratio = (float)size / (float)short_side;
-        int wide = (int)lrintf((float)image->width * ratio);
-        int high = (int)lrintf((float)image->height * ratio);
+        int long_side = yolo_max_int(image->width, image->height);
+        int fit_long = (int)((double)size * (double)long_side / (double)short_side);
+        int wide = image->width <= image->height ? size : fit_long;
+        int high = image->width <= image->height ? fit_long : size;
         int crop_left = (wide - size) / 2;
         int crop_top = (high - size) / 2;
-        float *room;
+        uint8_t *room;
         YoloMark mark;
+        int channel, row, column;
 
         plane = yolo_plane_take(&session->arena, 1, 3, size, size);
         if (!plane.cell_list) return YOLO_ERR_MEMORY;
         mark = yolo_arena_mark(&session->arena);
-        room = (float *)yolo_arena_take(&session->arena,
-            (size_t)3 * (size_t)wide * (size_t)high * sizeof(float));
+        room = (uint8_t *)yolo_arena_take(&session->arena,
+            (size_t)wide * (size_t)high * 3);
         if (!room) return YOLO_ERR_MEMORY;
-        status = yolo_pixels_scale(image->pixel_list, image->width, image->height,
-                                   image->width * image->channel_count,
-                                   image->channel_count, options->bgr_flag,
-                                   room, wide, high, wide, high, 0, 0, 255.0f);
+        status = yolo_pixels_shrink(image->pixel_list, image->width, image->height,
+                                    image->width * image->channel_count,
+                                    image->channel_count, options->bgr_flag,
+                                    room, wide, high);
         if (status != YOLO_OK) return status;
-        {
-            int channel, row;
-            for (channel = 0; channel < 3; channel++)
-                for (row = 0; row < size; row++)
-                    memcpy(plane.cell_list + ((size_t)channel * (size_t)size + (size_t)row)
-                                             * (size_t)size,
-                           room + (size_t)channel * (size_t)wide * (size_t)high
-                                + (size_t)(row + crop_top) * (size_t)wide + crop_left,
-                           (size_t)size * sizeof(float));
-        }
+        for (channel = 0; channel < 3; channel++)
+            for (row = 0; row < size; row++)
+                for (column = 0; column < size; column++)
+                    plane.cell_list[((size_t)channel * (size_t)size + (size_t)row)
+                                    * (size_t)size + (size_t)column] =
+                        (float)room[(((size_t)(row + crop_top) * (size_t)wide
+                                      + (size_t)(column + crop_left)) * 3)
+                                    + (size_t)channel] / 255.0f;
         yolo_arena_reset(&session->arena, mark);
-        frame_out->ratio = ratio;
+        frame_out->ratio = (float)size / (float)short_side;
         frame_out->pad_left = -crop_left;
         frame_out->pad_top = -crop_top;
         frame_out->fit_width = size;
         frame_out->fit_height = size;
+        session->input_width = size;
+        session->input_height = size;
         *plane_out = plane;
         return YOLO_OK;
     }
@@ -4922,6 +5070,24 @@ flag:
                 printf("  %-18s %.3f  %.1f %.1f %.1f %.1f\n",
                        yolo_model_class_name(model, box->class_index), box->score,
                        box->left, box->top, box->right, box->bottom);
+            if (box->keypoint_list) {
+                int point, size = yolo_model_keypoint_size(model);
+                printf("    kpt %d", index);
+                for (point = 0; point < yolo_model_keypoint_count(model)
+                                && point < 5; point++) {
+                    const float *at = box->keypoint_list + point * size;
+                    if (size > 2) printf(" %.1f,%.1f,%.2f", at[0], at[1], at[2]);
+                    else printf(" %.1f,%.1f", at[0], at[1]);
+                }
+                printf("\n");
+            }
+            if (box->mask_plane) {
+                size_t cell, inside = 0;
+                size_t total = (size_t)box->mask_width * (size_t)box->mask_height;
+                for (cell = 0; cell < total; cell++)
+                    if (box->mask_plane[cell]) inside++;
+                printf("    mask %d  %zu pixels\n", index, inside);
+            }
         }
         if (dump_path) {
             const YoloPlane *plane = yolo_session_input(session);
