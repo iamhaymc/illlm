@@ -5,50 +5,38 @@ run correctly today; everything here either makes it faster, makes it honest
 about what it costs, or lets it read a checkpoint it currently refuses.
 
 The order comes from where the time goes, and the cost split in `CHANGES.md`'s
-standing results is the argument for it. Decode reads every weight once a
-token and is now within about a tenth of what the memory on the measured host
-can deliver, so there is almost nothing left in the decode kernel: the items at
-the top read fewer bytes or get more than one token out of a single read, which
-are the only two moves remaining. Prefill is arithmetic bound and still has
-room. Everything below that is coverage, reliability and reach.
+standing results is the argument for it. Decode reads every weight once a token
+and is within about a tenth of what the memory on the measured host can
+deliver, so there is almost nothing left in the decode kernel: what remains is
+to read fewer bytes, or to get more than one token out of a read. `--draft`
+now does the second for greedy decoding; the items at the top do the first, and
+extend the second to the sampling most callers actually use. Prefill is
+arithmetic bound and still has room. Everything below that is coverage,
+reliability and reach.
 
 ## Engine
 
-1. **Mark and rewind a state, and apply a batch as a proposal.** `ill_model_apply`
-   advances a state by a batch and there is no way back. Give `IllState` a mark
-   that records the convolution windows, the key/value fill and the position,
-   and a return that restores them; then let a caller run k candidate tokens
-   through one forward pass, compare the row each produced against the token
-   that followed it, and rewind to the first disagreement. Nothing above this
-   item can be built without it. It is worth doing on its own because it also
-   closes `ill_state_crop`, which reports `ILL_STATE` on any model with
-   convolution layers today — the window is recurrent, so a partial rewind has
-   no way to reconstruct the three values it dropped, and a stored mark is that
-   way. One piece of machinery serves both.
-
-2. **Speculative decoding drafted from the context itself.** With item 1 in
-   place, take the last two or three tokens emitted, look for the same run
-   earlier in the prompt and in what has been generated so far, propose
-   whatever followed it, and verify the proposal in one pass. Every token
-   accepted past the first is close to free, because the weights were read
-   anyway — on a memory bound decode a four token batch costs little more than
-   a one token batch. It needs no second checkpoint, no training, no
-   dependency and no new file, which is the whole reason to prefer it here over
-   a draft model; and because the verifier's own row decides every token, the
-   text is the text greedy decoding would have produced. It pays best on work
-   the engine is actually asked to do — summarising, editing, answering from a
-   quoted document, rewriting code that is already on screen — where the match
-   hits often.
-
-3. **q4 weights.** Halving the bytes a token reads is the largest remaining
-   decode win after item 2, and it is the item that puts the 2.6B checkpoint
+1. **q4 weights.** Halving the bytes a token reads is the largest decode win
+   left, and it is the item that puts the 2.6B checkpoint
    under 1.5 GiB, where a laptop with 4 GiB of usable memory can hold it. Keep
    the same per-block shape as q8 so the loader, the repack and the plane
    dispatch all widen rather than fork. `perplexity` is the instrument that
    says whether it is landable, and the row it has to beat is what q8 measured
    — see the standing results.
 
-4. **Fuse the attention score row.** Scores are materialised per head before
+2. **Speculative sampling above temperature zero.** `--draft` refuses to
+   engage unless sampling is greedy, because accepting a candidate on the
+   ground that it equals an argmax is not a test a distribution can pass, and
+   a repetition penalty rewrites the row it is applied to. Most callers do not
+   decode greedily, so most callers get none of what drafting is worth. The
+   fix is the standard one — accept a candidate with probability
+   `min(1, p_target/p_draft)` and resample from the residual when it is
+   rejected — and it needs the draft to carry a distribution rather than a
+   bare token, which an n-gram scan does not have. Decide what a match is
+   worth as a probability before writing any of it; that choice is the whole
+   design.
+
+3. **Fuse the attention score row.** Scores are materialised per head before
    the softmax, so the scratch grows with context and the row is written and
    read again for no reason. A flash-style tiling with a running maximum and a
    running sum keeps the row in registers, and it is the difference between
@@ -56,27 +44,27 @@ room. Everything below that is coverage, reliability and reach.
    **Decision**: the running softmax sums in a different order, so the output
    moves; re-take the parity run and say so.
 
-5. **Pack the weight panel for prefill.** `dense` streams weight rows in their
+4. **Pack the weight panel for prefill.** `dense` streams weight rows in their
    stored layout, so a prefill wide enough to reuse a panel still re-reads it
    from wherever it fell out to. A blocked panel layout would keep the reused
    half in cache. The companion move — fusing more activation rows against one
    weight row — is spent: eight is where the registers run out on a machine
    with thirty-two of them, and sixteen measured level with four.
 
-6. **An AMX path for the q8 dot where the host has one.** The VNNI path folds
+5. **An AMX path for the q8 dot where the host has one.** The VNNI path folds
    four byte products into a lane; AMX does a tile at a time and is the next
    step up on the hosts that carry it. It is worth less than it looks on a
    single sequence — AMX wants many activation rows to fill a tile, so this is
    a prefill item and a batching item, not a decode item.
 
-7. **Store the key/value cache at half width.** It is f32 today, which is the
+6. **Store the key/value cache at half width.** It is f32 today, which is the
    dominant term in state memory once the context is long — a 4096 token state
    is 0.15 GiB and the window the checkpoint advertises is 131072. bf16 halves
    it for a rounding error the keys and values already carry, since they were
    bf16 in the checkpoint. **Decision**: the scores change in the last bits, so
    the output moves.
 
-8. **Runtime SIMD dispatch.** The vector width is chosen at compile time, so a
+7. **Runtime SIMD dispatch.** The vector width is chosen at compile time, so a
    binary built with `-march=native` faults on an older host and a binary built
    to be portable leaves half the machine unused. This matters more now than it
    did: the fastest path is gated on VNNI, so the gap between the portable
@@ -85,6 +73,17 @@ room. Everything below that is coverage, reliability and reach.
    that runs everywhere at the width the host actually has. It is a reliability
    item before it is a speed item — the failure it removes is a crash with no
    diagnosis.
+8. **Rewind into the middle of a pass.** A mark can only be returned to at
+   the point it was taken, so a round that rejects a proposal drops the
+   confirmed tokens back into the next round's pass and carries them there.
+   That costs nothing in weight reads — the pass was going to happen — but it
+   widens every pass while the carry lasts, and a carry that reaches the cap
+   spends a whole pass committing. Keeping the convolution signal for each
+   token of a batch, rather than only the window at its end, would let the
+   state stop exactly where the acceptance did. It is `conv_count * dim`
+   floats a token, so it is only affordable while a batch is small, which a
+   drafted batch is.
+
 
 9. **Prefetch the next panel while the current one is in flight.** Decode
    streams gigabytes a token along an entirely predictable stride, and cores
@@ -138,7 +137,7 @@ room. Everything below that is coverage, reliability and reach.
 17. **Batched sequences: several states advanced in one forward pass**, which
     turns many single-token decodes into one wide matrix multiply. This is the
     serving item: it does nothing for one user and most of what a server needs.
-    Item 1's mark and rewind is the harder half of it, and item 6 wants it.
+    `ill_state_mark` did the harder half of it, and item 5 wants it.
 
 18. **Speed the added-token scan.** It is linear in the number of added tokens
     at every input position, and the published checkpoint has 124 of them. An
@@ -211,10 +210,12 @@ again.
     because there is no second checkpoint to ship and the draft agrees with the
     verifier by construction rather than by training. **Risk**: the extra pass
     is only worth it if runs of accepted tokens are long, and q4 drift on a
-    2.6B model may be enough to break them. **Experiment**: with item 1 in
-    place, draft four tokens and record the mean accepted run over the tuning
-    corpus. **Stop rule**: abandon if the mean accepted run is below 1.6 tokens
-    at k=4, which is where the second weight read stops paying for itself.
+    2.6B model may be enough to break them. **Experiment**: `--draft` already
+    marks, verifies and rewinds, so this is a second weight plane and a draft
+    pass where the n-gram scan sits; draft four tokens and record the mean
+    accepted run over the tuning corpus. **Stop rule**: abandon if the mean
+    accepted run is below 1.6 tokens at k=4, which is where the second weight
+    read stops paying for itself.
 
 28. **A shortlist for the vocabulary head.** *Hypothesis*, *model-preserving if
     a bound is carried, approximate otherwise*. The head is 128000 rows of
@@ -245,7 +246,7 @@ again.
     product of an activation block against the 16 possible q4 nibbles, then
     index. **Risk**: the table has to stay in the fastest cache or the random
     access costs more than the multiply saved, which is the whole difficulty.
-    **Experiment**: only after item 3 exists, against its dot product.
+    **Experiment**: only after item 1 exists, against its dot product.
     **Stop rule**: abandon if it does not beat the direct q4 dot by 1.2x on
     decode.
 
@@ -255,11 +256,11 @@ again.
     that suits it is what makes a 4-bit key/value cache hold accuracy where a
     naive one does not. **Risk**: a per-channel key scale is read across the
     grain of the score loop, which may cost more than the narrower cache saves.
-    **Experiment**: after item 7, extend it downward. **Stop rule**: abandon
+    **Experiment**: after item 6, extend it downward. **Stop rule**: abandon
     below 8 bits if perplexity rises by more than 0.05.
 
 32. **Skip attention layers to make a self-draft.** *Hypothesis*, approximate
-    as a draft and *model-preserving* in what it emits, since item 1 verifies.
+    as a draft and *model-preserving* in what it emits, since the pass verifies.
     Twenty-two of the thirty layers are convolution, whose cost does not grow
     with context; the eight attention layers are the ones that do. A draft that
     runs the convolution layers and skips some of the attention ones is cheap

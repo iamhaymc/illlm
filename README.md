@@ -19,6 +19,9 @@ python3 util/make.py build                             # a few seconds, no depen
 ```
 
 Add `--quant q8` to halve the memory and roughly double decode speed. Add
+`--draft 4` to greedy decoding to verify four context-drafted tokens in each
+pass, which is worth about a quarter on work whose answer quotes its question
+and costs nothing when it does not. Add
 `--threads N` to pick a worker count; the default is the host's core count.
 
 ```sh
@@ -99,8 +102,9 @@ and biased convolution kernels; f32, f16, and bf16 storage; chunked prefill and
 single token decode; and tokenizer agreement over a corpus of awkward strings.
 
 Against float32 checkpoints the engine matches the reference to **2e-7
-relative**, which is float32 rounding. `test/test.c` adds 100 unit checks over the
-internals. Both suites run clean under AddressSanitizer and UndefinedBehaviorSanitizer.
+relative**, which is float32 rounding. `test/test.c` adds 108 unit checks over
+the internals. Both suites run clean under AddressSanitizer and
+UndefinedBehaviorSanitizer.
 
 ### Comparison
 

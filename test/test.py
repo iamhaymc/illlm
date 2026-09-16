@@ -594,11 +594,13 @@ def check_throughput(binary, folder, filter_text):
            f"reference prefill {their_fill:.1f}, decode {their_step:.1f}")
 
 
-def engine_generate(binary, folder, ids, steps):
+def engine_generate(binary, folder, ids, steps, draft=0):
     """Greedy continuation from raw ids, returned as text."""
     cmd = [binary, "generate", "--model", folder, "--raw",
            "--tokens", ",".join(str(i) for i in ids),
            "--max-tokens", str(steps), "--temp", "0", "--quiet"]
+    if draft:
+        cmd += ["--draft", str(draft)]
     done = subprocess.run(cmd, capture_output=True, text=True)
     if done.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)}\n{done.stdout}\n{done.stderr}")
@@ -692,6 +694,50 @@ def check_greedy(binary, folder, filter_text):
            f"{their_share}: {my_text[:60]!r}")
 
 
+def check_draft(binary, folder, filter_text):
+    """Drafting must not change a single character of what greedy emits.
+
+    `--draft` verifies proposed tokens inside one forward pass and returns the
+    state to a mark whenever a proposal is rejected, so it exercises
+    `ill_state_mark`, `ill_state_back` and the convolution window they copy.
+    Every token it emits is still the one the model's own row chose, so the
+    check is exact equality against the same run without it, not a tolerance.
+
+    It runs against the checkpoint rather than a synthetic model on purpose.
+    A model with random weights tends to settle on one token, which a draft
+    proposes and the model then accepts every time -- the rewind is never
+    reached and the check passes whatever the rewind does. Against a trained
+    checkpoint, proposals are accepted and rejected in turn, and breaking the
+    window restore parts the two runs.
+
+    The prompt asks for something repeated so the scan has matches to find, and
+    two widths are run so both the carry and the commit path are reached.
+    """
+    label = "checkpoint/draft"
+    if filter_text and filter_text not in label:
+        return
+    announce(label, "--draft 4 and 8 against plain greedy, exact equality")
+    text = ("List the first eight prime numbers, then list them again in reverse "
+            "order, then explain what a prime number is.")
+
+    def emit(*extra):
+        cmd = [binary, "generate", "--model", folder, "--prompt", text,
+               "--max-tokens", str(STEP_TOKENS), "--temp", "0", "--quiet", *extra]
+        done = subprocess.run(cmd, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd)}\n{done.stderr}")
+        return done.stdout
+
+    plain = emit()
+    detail = []
+    for width in (4, 8):
+        drafted = emit("--draft", str(width))
+        if drafted != plain:
+            detail.append(f"draft {width} parts at character "
+                          f"{shared_prefix(drafted, plain)} of {len(plain)}")
+    record(label, not detail, "identical" if not detail else "; ".join(detail))
+
+
 # ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
@@ -764,6 +810,7 @@ def main():
             check_checkpoint(args.binary, args.model, args.filter)
             check_throughput(args.binary, args.model, args.filter)
             check_greedy(args.binary, args.model, args.filter)
+            check_draft(args.binary, args.model, args.filter)
     finally:
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)

@@ -24,7 +24,7 @@ Five source files, flat, no build system, plus the published checkpoints in
 | --- | --- | --- |
 | `app/core.c` | ~4500 | the engine: a header and its implementation in one file |
 | `app/main.c` | ~670 | the command line, six verbs |
-| `test/test.c` | ~910 | unit tests over the engine internals |
+| `test/test.c` | ~980 | unit tests over the engine internals |
 | `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
 | `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
@@ -443,6 +443,10 @@ app_main perplexity  score a text, so an accuracy trade has a number
 `app_main help` lists every flag. Three are worth knowing:
 
 - `--quant q8` repacks at load: half the memory, roughly double the decode rate.
+- `--draft N` proposes `N` tokens from the context and verifies them in the
+  same pass, which is worth about a quarter on work whose answer quotes its
+  question and nothing on work that invents every token. Greedy only, and the
+  text is byte for byte the text without it.
 - `--raw` feeds the prompt verbatim instead of shaping a chat turn around it.
 - `--tokens 1,2,3` supplies ids directly, which is how the engine is exercised
   against a checkpoint whose tokenizer it cannot read.
@@ -465,7 +469,7 @@ trades accuracy for speed can be judged rather than argued about; the cost of
 
 Three layers, each catching what the others cannot.
 
-**`test/test.c` — 100 unit checks.** Number formats against their definitions;
+**`test/test.c` — 108 unit checks.** Number formats against their definitions;
 the JSON reader against nested documents, escapes, surrogates, and eight
 malformed inputs; every kernel against a plain-C restatement of the same
 arithmetic written independently in the test, at every tile width the dispatch
@@ -474,8 +478,9 @@ for; rotary, attention, and convolution against direct transcriptions of their
 equations, including the convolution window carried across calls; the thread
 pool for exact-once execution over many widths and repeated forks; the
 pre-tokenizer chunk by chunk; the merge heap; the row normaliser a score is
-built on; the rule that decides when a streamed character is whole; and the
-sampler for seed replay, nucleus containment, and repetition demotion.
+built on; the rule that decides when a streamed character is whole; the scan
+that drafts a continuation from the context; and the sampler for seed replay,
+nucleus containment, and repetition demotion.
 
 **`test/test.py` — 19 comparisons against `transformers`.** Small Liquid
 checkpoints are built with random weights and run through both implementations.
@@ -498,7 +503,7 @@ Against f32 checkpoints the engine matches to 2e-7 relative — float32 rounding
 UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
 A real checkpoint is tested the same way: `make.py test --model PATH` adds a
-logits comparison and a tokenizer comparison against it, for 23 comparisons in
+logits comparison and a tokenizer comparison against it, for 24 comparisons in
 all. The published checkpoints ship in `ckpt/` (`ckpt/0.4b`, `ckpt/1.2b`,
 `ckpt/2.6b`), with `ckpt/0.4b` (LFM2.5-350M) the default, so this runs by
 default, and it adds two further checks the synthetic suite cannot make:

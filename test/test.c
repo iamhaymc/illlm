@@ -787,6 +787,75 @@ static void test_sampler(void)
                   got > 799.0 && got < 801.0, "%.6f", got);
     }
 
+    test_open("drafting");
+    {   /* The proposal is what followed the last earlier appearance of the
+           tail.  Nothing here decides a token -- a wrong proposal costs a row
+           that was computed anyway -- so what is checked is that it proposes
+           the right thing and never proposes out of thin air. */
+        int32_t out[8];
+        {   /* "1 2 3" appeared at the start, followed by 4 5 9 9, and those
+               four are what the tail's repeat proposes. */
+            int32_t seen[] = { 1, 2, 3, 4, 5, 9, 9, 1, 2, 3 };
+            int32_t got = ill_draft_scan(seen, 10, 3, out, 4);
+            test_case("a repeated run proposes what followed it",
+                      got == 4 && out[0] == 4 && out[1] == 5 &&
+                      out[2] == 9 && out[3] == 9, "%d: %d %d %d %d",
+                      (int)got, (int)out[0], (int)out[1], (int)out[2], (int)out[3]);
+        }
+        {   /* Two earlier places match; the later one wins, because it is the
+               one the text has most recently been near. */
+            int32_t seen[] = { 7, 8, 100, 0, 0, 7, 8, 200, 0, 0, 7, 8 };
+            int32_t got = ill_draft_scan(seen, 12, 2, out, 1);
+            test_case("the most recent earlier match wins",
+                      got == 1 && out[0] == 200, "%d: %d", (int)got, (int)out[0]);
+        }
+        {   /* Long runs are tried before short ones, and the two pull apart
+               here: the three token tail "1 2 3" last appeared at the start
+               and was followed by 100, while its last two tokens "2 3"
+               appeared more recently and were followed by 200.  Length wins
+               over recency, because the longer agreement is the one whose
+               continuation is worth believing. */
+            int32_t seen[] = { 1, 2, 3, 100, 9, 2, 3, 200, 1, 2, 3 };
+            int32_t got = ill_draft_scan(seen, 11, 3, out, 1);
+            test_case("a longer run is preferred to a nearer short one",
+                      got == 1 && out[0] == 100, "%d: %d", (int)got, (int)out[0]);
+        }
+        {   /* Nothing repeats, so nothing is proposed.  A draft that invents a
+               token would still be safe, but it would waste the row. */
+            int32_t seen[] = { 1, 2, 3, 4, 5, 6 };
+            test_case("an unrepeated tail proposes nothing",
+                      ill_draft_scan(seen, 6, 3, out, 4) == 0, "");
+        }
+        {   /* A pattern that has already repeated once proposes that it
+               repeats again, which is the whole point: the match ends where
+               the tail begins, and what followed it is the tail itself. */
+            int32_t seen[] = { 1, 2, 3, 1, 2, 3 };
+            int32_t got = ill_draft_scan(seen, 6, 3, out, 4);
+            test_case("a pattern that repeated proposes it repeats again",
+                      got == 3 && out[0] == 1 && out[1] == 2 && out[2] == 3,
+                      "%d: %d %d %d", (int)got, (int)out[0], (int)out[1], (int)out[2]);
+        }
+
+        {   /* A match is only ever looked for strictly before the tail, so a
+               run can never propose itself by matching where it stands. */
+            int32_t seen[] = { 4, 4, 4, 4 };
+            int32_t got = ill_draft_scan(seen, 4, 2, out, 2);
+            test_case("the tail never matches where it stands",
+                      got >= 1 && out[0] == 4, "%d: %d", (int)got, (int)out[0]);
+        }
+        {   /* Never more than asked for, whatever is available. */
+            int32_t seen[] = { 1, 2, 3, 4, 5, 6, 7, 8, 1, 2 };
+            int32_t got = ill_draft_scan(seen, 10, 2, out, 2);
+            test_case("it proposes no more than it is asked for",
+                      got == 2 && out[0] == 3 && out[1] == 4, "%d", (int)got);
+        }
+        {   /* Too short to have a tail and a match both. */
+            int32_t seen[] = { 1, 2 };
+            test_case("too short a history proposes nothing",
+                      ill_draft_scan(seen, 2, 3, out, 4) == 0, "");
+        }
+    }
+
     test_open("sampler");
     for (index = 0; index < vocab; ++index) logits[index] = (float)index * 0.1f;
     logits[40] = 100.0f;

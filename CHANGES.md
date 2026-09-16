@@ -32,6 +32,11 @@ the kernel and the rest has to come from somewhere else.
 Prefill is arithmetic bound instead, and has further to go: 32.6 tok/s on the
 same host is 88 G multiply-adds a second.
 
+That ceiling is a ceiling on **reads**, not on tokens. `--draft` (1.5.0) gets
+more than one token out of a read by verifying proposals in the same pass, and
+takes greedy decoding to 11.8 tok/s on work whose answer quotes its question —
+past the bare-read figure, because the read is no longer one token's.
+
 ### What q8 costs
 
 Measured by `perplexity` (1.3.0) on the published 2.6B checkpoint, over two
@@ -635,3 +640,117 @@ hold nothing left it passing. With the test's own rule it fails, as do the
 three cases that name a held count.
 
 **100 pass**, 89 before.
+
+---
+
+## 1.5.0 — the context drafts, the model verifies
+
+Decode reads 2.83 GiB to produce one token, and on `xeon-2.8` that read is 89%
+of everything the memory can deliver. There is no faster way to read those
+bytes. The only moves left are to read fewer of them, or to get more than one
+token out of a read, and this is the second.
+
+### What it took
+
+- **A mark on the state.** `ill_state_mark` remembers where a sequence is and
+  `ill_state_back` returns to it. The key/value cache needs nothing saved: it
+  is appended to, the attention scan is bounded by the fill at the time, and
+  the rows past a rewound fill are written over by whatever arrives next. What
+  a mark costs is a copy of the convolution window — `conv_count * model_dim *
+  (conv_width - 1)` floats, 352 KiB on the 2.6B — claimed on the first mark so
+  a caller that never marks never pays for it.
+
+  `ill_state_crop` reported `ILL_STATE` on any model with convolution layers,
+  because the window is recurrent and a partial rewind could not reconstruct
+  the values it dropped. It now succeeds at the fill a mark was taken at, which
+  is exactly the case where those values were kept. Anywhere else it still
+  refuses, and says why.
+
+- **`ill_draft_scan`**, which proposes a continuation by finding where the tail
+  of the sequence last appeared earlier in it and copying what followed. Runs
+  of three are tried before runs of two, because the longer agreement is the
+  one whose continuation is worth believing.
+
+- **A verification loop** behind `--draft N`. The proposal goes through one
+  forward pass with the tokens carried from the previous round, and each
+  proposed token is checked against the model's own choice for that slot.
+  Where the proposals all hold, the state is already the confirmed sequence and
+  the mark moves forward. Where one is rejected, the state holds tokens that
+  will not be emitted, so it goes back to the mark and the confirmed tokens
+  ride into the next round's pass — which costs nothing, because that pass was
+  going to read the weights anyway.
+
+  That is why one mark is enough. Returning to the middle of a batch would need
+  a window the state does not keep; returning to its start needs only the copy
+  the mark took. The carry is capped at sixteen so a long run of rejections
+  cannot widen every pass from there on.
+
+### What it is worth
+
+The published 2.6B at q8 on `xeon-2.8`, greedy, 160 tokens, the best of paired
+runs:
+
+| what was asked for | plain | `--draft 4` | |
+| --- | --- | --- | --- |
+| quote a document back, then describe it | 9.2 tok/s | 11.8 tok/s | **1.29x** |
+| rewrite a C function, changing one thing | 9.2 tok/s | 11.1 tok/s | **1.21x** |
+| repeat a sentence, then explain it | 9.2 tok/s | 10.7 tok/s | **1.16x** |
+| invent an original fable | 9.1 tok/s | 9.1 tok/s | **1.00x** |
+
+**The downside is nothing and the upside is about a quarter.** That asymmetry
+is the point: a rejected proposal costs a row in a pass that was already
+reading the weights, so work whose answer quotes its question gains and work
+that invents every token loses nothing measurable.
+
+`--draft 8` is worse than `--draft 4`, not better — 9.9 tok/s against 11.8 on
+the quoting prompt. Past a handful of tokens the pass stops being free and
+acceptance does not keep up with the arithmetic. Four is not tuned, it is
+merely better than eight; the flag takes a number because the right one is a
+property of the work.
+
+### That it is the same answer
+
+Every token emitted is the one the model's own row chose; the draft only
+decides which rows get computed early. So the bar is not a tolerance but exact
+equality, and it holds: greedy `generate` and `chat` on the 2.6B are byte
+identical with `--draft 4`, with `--draft 8`, and without.
+
+`--draft` refuses to engage above temperature zero and says so. Accepting a
+candidate because it equals an argmax is not a test a sampled distribution can
+pass, and a repetition penalty rewrites the row it is applied to, which a
+verification pass must do exactly once. Quietly biasing sampling toward
+whatever appeared earlier in the prompt would be a worse bargain than the
+speed. The proper acceptance rule is open as its own item.
+
+### Code
+
+`app/core.c`: `ill_state_mark`, `ill_state_back` and `ill_state_mark_at` in
+part 11, `ill_draft_scan` in part 14, and `ill_state_crop` consulting the mark.
+`app/main.c`: `AppDraft` and the rewritten `app_run_loop`, plus `--draft N`.
+
+### Tests
+
+Eight checks on the scan: what a repeated run proposes, that the most recent
+match wins, that a longer run beats a nearer short one, that an unrepeated tail
+proposes nothing, that a pattern which already repeated proposes it repeats
+again, that the tail never matches where it stands, that it never proposes more
+than it is asked for, and that too short a history proposes nothing.
+
+Two of those started as wrong expectations rather than bugs: a scan asked for
+four tokens returns four when four followed, and a sequence that has already
+repeated proposes that it repeats again. The behaviour was right and the tests
+were rewritten to say so. A third fixture did not discriminate — it agreed on
+the answer whether long runs or short ones were tried first — and was rebuilt
+so the two pull apart.
+
+The end to end check is `checkpoint/draft` in the reference harness: `--draft
+4` and `--draft 8` against plain greedy, exact equality. It runs against the
+checkpoint and not a synthetic model on purpose. The first version built a
+random-weight model, which settles on one token that a draft proposes and the
+model accepts every time — the rewind was never reached, and breaking the
+window restore left the check passing. Against the 350M checkpoint proposals
+are accepted and rejected in turn: dropping the window restore parts the runs
+at character 34, and dropping the fill rewind parts them at 37.
+
+**108 pass**, 100 before, and 24 in the reference harness against the 2.6B,
+23 before.

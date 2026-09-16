@@ -171,9 +171,26 @@ int32_t   ill_state_fill(const IllState *state);   /* cached token count    */
 int32_t   ill_state_span(const IllState *state);   /* cache capacity        */
 size_t    ill_state_bytes(const IllState *state);
 
-/* Rewinds the sequence to `fill` tokens.  Only the key/value cache can be
- * rewound exactly; the stride cache is recurrent, so a rewind past the last
- * `conv_width - 1` tokens is reported as ILL_STATE. */
+/* Remembers where the sequence is, so it can be returned to.  One mark is
+ * kept; marking again replaces it.  The key/value cache needs nothing saved --
+ * it is appended to and the rows past `fill` are simply overwritten -- so what
+ * a mark costs is a copy of the convolution window, which is
+ * `conv_count * model_dim * (conv_width - 1)` floats and is taken once. */
+IllResult ill_state_mark(IllState *state);
+
+/* Returns the sequence to the mark.  ILL_STATE when nothing is marked.  After
+ * it, the state is what it was when `ill_state_mark` was called, and tokens
+ * applied in between are gone as though they had not been. */
+IllResult ill_state_back(IllState *state);
+
+/* The fill the mark was taken at, or -1 when nothing is marked. */
+int32_t   ill_state_mark_at(const IllState *state);
+
+/* Rewinds the sequence to `fill` tokens.  On a model with convolution layers
+ * the stride cache is recurrent, so only two points can be reached: zero, and
+ * a fill that a mark was taken at.  Anything else is reported as ILL_STATE,
+ * because the window it would need cannot be reconstructed from what is kept.
+ * A model without convolution layers can be cropped anywhere. */
 IllResult ill_state_crop(IllState *state, int32_t fill);
 
 /* -- forward pass --------------------------------------------------------- */
@@ -237,6 +254,22 @@ void      ill_sampler_free(IllSampler *sampler);
 void      ill_sampler_wipe(IllSampler *sampler);
 void      ill_sampler_note(IllSampler *sampler, int32_t token);
 int32_t   ill_sampler_pick(IllSampler *sampler, float *logits);
+
+/* Proposes a continuation by finding where the tail of `seen` last appeared
+ * earlier in it, and copying what followed.  Writes at most `want` ids into
+ * `out` and returns how many; zero when nothing repeats.
+ *
+ * This is the draft half of speculative decoding without a draft model: a
+ * decode step reads every weight to produce one token, so several candidate
+ * tokens verified in one pass cost one weight read rather than several, and a
+ * candidate the model would have chosen anyway is a token that came free.
+ * Runs of `reach` tokens are tried first and then shorter ones down to two,
+ * because a long run's continuation is the one worth believing.
+ *
+ * It proposes; it does not decide.  Whatever a caller does with the result,
+ * the tokens it emits should be the ones the model's own rows chose. */
+int32_t ill_draft_scan(const int32_t *seen, int32_t count, int32_t reach,
+                       int32_t *out, int32_t want);
 
 /* -- compute backend ------------------------------------------------------
  *
@@ -2980,6 +3013,8 @@ struct IllState {
     float    *keys;        /* attn_count * groups * span * head_dim          */
     float    *vals;
     float    *hist;        /* conv_count * model_dim * (conv_width - 1)      */
+    float    *echo;        /* the window as it stood at the mark, or NULL    */
+    int32_t   echo_fill;   /* fill at the mark, or -1 when nothing is marked */
 
     float    *lane;        /* residual stream, batch * model_dim             */
     float    *rest;        /* normalised stream                              */
@@ -3043,6 +3078,7 @@ IllResult ill_state_make(IllState **out, IllModel *model, int32_t span)
     if (!state) return ILL_ALLOC;
     state->model = model;
     state->span  = span;
+    state->echo_fill = -1;          /* zeroed memory would read as a mark at 0 */
     state->batch = ILL_MIN(model->batch_span, span);
     if (state->batch < 1) state->batch = 1;
 
@@ -3114,6 +3150,7 @@ void ill_state_reset(IllState *state)
     if (!state) return;
     arch = &state->model->arch;
     state->fill = 0;
+    state->echo_fill = -1;          /* the sequence it pointed into is gone */
     if (state->hist)
         memset(state->hist, 0, (size_t)arch->conv_count * arch->model_dim *
                                (size_t)ILL_MAX(arch->conv_width - 1, 1) * sizeof(float));
@@ -3123,14 +3160,62 @@ int32_t ill_state_fill(const IllState *state) { return state ? state->fill : 0; 
 int32_t ill_state_span(const IllState *state) { return state ? state->span : 0; }
 size_t  ill_state_bytes(const IllState *state) { return state ? state->bytes : 0; }
 
+/* How many floats the convolution window occupies.  Zero on a model that has
+ * no convolution layers, where a mark is the fill and nothing else. */
+static size_t ill_state_window(const IllState *state)
+{
+    const IllArch *arch = &state->model->arch;
+    if (arch->conv_count <= 0 || !state->hist) return 0;
+    return (size_t)arch->conv_count * (size_t)arch->model_dim *
+           (size_t)ILL_MAX(arch->conv_width - 1, 1);
+}
+
+IllResult ill_state_mark(IllState *state)
+{
+    size_t cells;
+    if (!state) return ILL_ARGS;
+    cells = ill_state_window(state);
+    /* The saved window is claimed on the first mark rather than at
+     * ill_state_make, so a caller that never marks never pays for it. */
+    if (cells > 0 && !state->echo) {
+        state->echo = (float *)ill_state_own(state, cells * sizeof(float));
+        if (!state->echo) return ILL_ALLOC;
+    }
+    if (cells > 0) memcpy(state->echo, state->hist, cells * sizeof(float));
+    state->echo_fill = state->fill;
+    return ILL_OK;
+}
+
+IllResult ill_state_back(IllState *state)
+{
+    size_t cells;
+    if (!state) return ILL_ARGS;
+    if (state->echo_fill < 0) return ILL_STATE;
+    cells = ill_state_window(state);
+    if (cells > 0) memcpy(state->hist, state->echo, cells * sizeof(float));
+    /* Nothing is done to the key/value cache.  Rows past `fill` are never
+     * read -- the attention scan is bounded by the fill at the time -- and the
+     * next tokens to arrive write over them. */
+    state->fill = state->echo_fill;
+    return ILL_OK;
+}
+
+int32_t ill_state_mark_at(const IllState *state)
+{
+    return state ? state->echo_fill : -1;
+}
+
 IllResult ill_state_crop(IllState *state, int32_t fill)
 {
     if (!state || fill < 0 || fill > state->fill) return ILL_ARGS;
     if (fill == state->fill) return ILL_OK;
     if (fill == 0) { ill_state_reset(state); return ILL_OK; }
     if (state->model->arch.conv_count > 0) {
-        /* The convolution window is recurrent: dropping tokens from the tail
-         * cannot be undone without replaying the sequence. */
+        /* The convolution window is recurrent, so dropping tokens from the
+         * tail cannot be undone from what the state holds -- unless this is
+         * the point a mark was taken at, where the window was saved and the
+         * rewind is exact. */
+        if (fill == state->echo_fill && state->echo) return ill_state_back(state);
         return ILL_STATE;
     }
     state->fill = fill;
@@ -4580,6 +4665,29 @@ int32_t ill_sampler_pick(IllSampler *sampler, float *logits)
         if (draw <= 0.0f) return sampler->cands[index].token;
     }
     return sampler->cands[keep - 1].token;
+}
+
+/* -- drafting -------------------------------------------------------------- */
+
+int32_t ill_draft_scan(const int32_t *seen, int32_t count, int32_t reach,
+                       int32_t *out, int32_t want)
+{
+    int32_t run, at, took;
+    if (!seen || !out || want <= 0 || count < 3) return 0;
+    if (reach < 2) reach = 2;
+    for (run = reach; run >= 2; --run) {
+        const int32_t *tail = seen + count - run;
+        /* A run needs somewhere earlier to have been, and something to have
+         * followed it there, so a match at the very end proposes nothing. */
+        if (count < run + 2) continue;
+        for (at = count - run - 1; at >= 0; --at) {
+            if (memcmp(seen + at, tail, (size_t)run * sizeof(int32_t)) != 0) continue;
+            for (took = 0; took < want && at + run + took < count; ++took)
+                out[took] = seen[at + run + took];
+            if (took > 0) return took;
+        }
+    }
+    return 0;
 }
 
 /* ============================================================================
