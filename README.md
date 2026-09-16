@@ -1,7 +1,7 @@
 <table>
 <tbody>
 <tr>
-<td><img src="./docs/logo_3.svg" width="64px"/></td>
+<td><img src="./docs/brand/logo_3.svg" width="64px"/></td>
 <td><h1 style="color:#123;">INFERLIQ</h1></td>
 </tr>
 </tbody>
