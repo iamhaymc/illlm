@@ -2,9 +2,10 @@
 """util/make.py -- the project's workflows: install, build, test, run.
 
   python3 util/make.py install            set up the reference stack for test/test.py
-  python3 util/make.py build              compile app/main.c and test/test.c into build/
+  python3 util/make.py build              compile app/main.c, app/yolo.c and test/test.c into build/
   python3 util/make.py test               run the unit tests and the reference suite
   python3 util/make.py run -- <args>      build, then hand <args> to app
+  python3 util/make.py yolo -- <args>     build, then hand <args> to the picture engine
   python3 util/make.py bench --model DIR  build, then time prefill and decode
   python3 util/make.py clean              remove build/
   python3 util/make.py all                install, build, test
@@ -34,6 +35,7 @@ NEEDS = ["torch", "transformers", "safetensors", "numpy", "tokenizers"]
 # output binary names, built into build/
 APP = "app_main"
 TEST = "app_test"
+YOLO = "app_yolo"
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +130,12 @@ def build_flags(cc, args):
     return flags, link, False
 
 
-def compile_one(cc, source, target, flags, link, msvc):
+def compile_one(cc, source, target, flags, link, msvc, extra=()):
     os.makedirs(BUILD, exist_ok=True)
     if msvc:
-        cmd = [cc, *flags, source, f"/Fe:{target}", f"/Fo:{target}.obj"]
+        cmd = [cc, *flags, *extra, source, f"/Fe:{target}", f"/Fo:{target}.obj"]
     else:
-        cmd = [cc, *flags, source, "-o", target, *link]
+        cmd = [cc, *flags, *extra, source, "-o", target, *link]
     return call(cmd, cwd=ROOT)
 
 
@@ -148,10 +150,27 @@ def do_build(args):
     print(f"  flavour: {'no-simd' if args.no_simd else 'portable' if args.portable else 'native'}"
           f"{', debug' if args.debug else ''}{', sanitize' if args.sanitize else ''}")
     suffix = ".exe" if os.name == "nt" else ""
-    for source, name in ((os.path.join("app", "main.c"), APP),
-                         (os.path.join("test", "test.c"), TEST)):
+    # app/yolo.c is a library first and a command line second, so it only
+    # grows a main() when YOLO_MAIN is defined.
+    #
+    # It is also built at -O2 rather than -O3, which is measured rather than
+    # preferred: -O3's loop vectoriser rewrites the eight-by-eight tile the
+    # convolution's inner kernel holds in registers, spills it, and costs 70%.
+    # On this host, yolo26n over bus.png, the minimum of five runs: -O3 645 ms,
+    # -O2 510 ms, -O2 with -funroll-loops 376 ms.  Same numbers out of all
+    # three.  -O3 stays for everything else, where it is not in the way.
+    yolo_extra = [] if msvc else [f for f in ("-O2", "-funroll-loops")
+                                  if accepts(cc, [f])]
+    define = "/DYOLO_MAIN" if msvc else "-DYOLO_MAIN"
+    if args.debug or args.sanitize:
+        yolo_extra = []
+    for source, name, extra in ((os.path.join("app", "main.c"), APP, ()),
+                                (os.path.join("app", "yolo.c"), YOLO,
+                                 tuple(yolo_extra) + (define,)),
+                                (os.path.join("test", "test.c"), TEST, ())):
         code = compile_one(cc, os.path.join(ROOT, source),
-                           os.path.join(BUILD, name + suffix), flags, link, msvc)
+                           os.path.join(BUILD, name + suffix), flags, link, msvc,
+                           extra)
         if code != 0:
             print(f"build failed: {source}")
             return code
@@ -218,6 +237,19 @@ def do_run(args):
     return call([os.path.join(BUILD, APP + suffix), *rest])
 
 
+def do_yolo(args):
+    """Run the picture engine: everything after `--` goes to it."""
+    code = do_build(args)
+    if code != 0:
+        return code
+    suffix = ".exe" if os.name == "nt" else ""
+    rest = list(args.rest)
+    if not rest:
+        rest = ["--help"]
+    say("yolo")
+    return call([os.path.join(BUILD, YOLO + suffix), *rest])
+
+
 def do_bench(args):
     code = do_build(args)
     if code != 0:
@@ -252,6 +284,7 @@ WORKFLOWS = {
     "build": do_build,
     "test": do_test,
     "run": do_run,
+    "yolo": do_yolo,
     "bench": do_bench,
     "clean": do_clean,
     "all": do_all,

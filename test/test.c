@@ -11,6 +11,12 @@
 
 #include "../app/core.c"
 
+/* The yolo engine is the second translation unit this file proves.  It is
+ * built without stb here: the tests generate their own pictures, and the
+ * engine reads binary PNM without a library. */
+#define YOLO_NO_STB
+#include "../app/yolo.c"
+
 /* -- harness --------------------------------------------------------------- */
 
 static int32_t test_ran, test_bad;
@@ -1072,6 +1078,536 @@ static void test_paths(void)
               ill_type_size(ILL_TYPE_Q4, 9) == 5, "");
 }
 
+/* -- the yolo engine ------------------------------------------------------- */
+
+/* Half to float, on the patterns that have caught this conversion before:
+ * the subnormals a small model is full of, and the two zeroes. */
+static void test_yolo_numbers(void)
+{
+    test_open("yolo numbers");
+    test_case("one and minus two round trip",
+              yolo_half_float(0x3C00) == 1.0f && yolo_half_float(0xC000) == -2.0f, "");
+    test_case("both zeroes stay zero",
+              yolo_half_float(0x0000) == 0.0f && yolo_half_float(0x8000) == 0.0f, "");
+    test_case("the smallest subnormal is not flushed",
+              yolo_half_float(0x0001) > 0.0f
+              && test_near(yolo_half_float(0x0001), 5.9604645e-8f, 1e-12f), "");
+    test_case("the largest subnormal is a whole step below the smallest normal",
+              test_near(yolo_half_float(0x03FF) + yolo_half_float(0x0001),
+                        yolo_half_float(0x0400), 1e-12f), "");
+    test_case("infinity survives",
+              yolo_half_float(0x7C00) > 1e30f && yolo_half_float(0xFC00) < -1e30f, "");
+    test_case("a half's mantissa lands in the right bits",
+              yolo_half_float(0x3555) > 0.333f && yolo_half_float(0x3555) < 0.334f,
+              "%g", (double)yolo_half_float(0x3555));
+}
+
+/* What the arena promises a caller: a mark releases everything taken after it
+ * and nothing taken before it, and a release keeps the memory for next time. */
+static void test_yolo_arena(void)
+{
+    YoloArena arena;
+    YoloMark mark;
+    char *first, *second;
+    size_t was;
+
+    test_open("yolo arena");
+    yolo_arena_open(&arena, 4096);
+    first = (char *)yolo_arena_take(&arena, 100);
+    first[0] = 7;
+    mark = yolo_arena_mark(&arena);
+    second = (char *)yolo_arena_take(&arena, 100);
+    test_case("a take does not overlap the one before it",
+              second >= first + 100 || second + 100 <= first, "");
+    was = arena.live_size;
+    yolo_arena_reset(&arena, mark);
+    test_case("a reset gives back what came after the mark",
+              arena.live_size < was, "%zu then %zu", was, arena.live_size);
+    test_case("what came before the mark survives it", first[0] == 7, "");
+    test_case("the memory is reused rather than freed",
+              (char *)yolo_arena_take(&arena, 100) == second, "");
+    test_case("a take is aligned for a vector load",
+              ((uintptr_t)yolo_arena_take(&arena, 4) & 63u) == 0, "");
+    {
+        void *big = yolo_arena_take(&arena, 1 << 20);
+        test_case("a request larger than a block still lands", big != NULL, "");
+    }
+    yolo_arena_clear(&arena);
+    test_case("a clear empties the arena", arena.live_size == 0, "");
+    yolo_arena_close(&arena);
+}
+
+/* Every kernel against a plain restatement of the same arithmetic.  The
+ * restatements are deliberately the slow obvious loop: if the two agree, the
+ * blocking and the register tiling in the real one did not change the answer. */
+static void test_yolo_kernels(void)
+{
+    const YoloBackend *backend = yolo_backend_cpu();
+    YoloArena arena;
+    float *a_list, *b_list, *got, *want;
+    int row, mid, col, index;
+
+    test_open("yolo kernels");
+    yolo_arena_open(&arena, 1 << 20);
+
+    /* the matrix multiply at a shape that crosses a block and a tile */
+    a_list = (float *)yolo_arena_take(&arena, 37 * 29 * sizeof(float));
+    b_list = (float *)yolo_arena_take(&arena, 29 * 411 * sizeof(float));
+    got = (float *)yolo_arena_take(&arena, 37 * 411 * sizeof(float));
+    want = (float *)yolo_arena_take(&arena, 37 * 411 * sizeof(float));
+    for (index = 0; index < 37 * 29; index++) a_list[index] = test_real();
+    for (index = 0; index < 29 * 411; index++) b_list[index] = test_real();
+    backend->gemm_run(backend, a_list, b_list, got, 37, 29, 411, 29, 411, 411, 0);
+    for (row = 0; row < 37; row++)
+        for (col = 0; col < 411; col++) {
+            float total = 0.0f;
+            for (mid = 0; mid < 29; mid++)
+                total += a_list[row * 29 + mid] * b_list[mid * 411 + col];
+            want[row * 411 + col] = total;
+        }
+    test_case("the blocked multiply matches a plain one",
+              test_gap(got, want, 37 * 411) < 1e-5f,
+              "%.2e", (double)test_gap(got, want, 37 * 411));
+
+    backend->gemm_run(backend, a_list, b_list, got, 37, 29, 17, 29, 29, 17, 1);
+    for (row = 0; row < 37; row++)
+        for (col = 0; col < 17; col++) {
+            float total = 0.0f;
+            for (mid = 0; mid < 29; mid++)
+                total += a_list[row * 29 + mid] * b_list[col * 29 + mid];
+            want[row * 17 + col] = total;
+        }
+    test_case("the swapped multiply matches a plain one",
+              test_gap(got, want, 37 * 17) < 1e-5f, "");
+
+    /* a strided, padded convolution against a direct restatement */
+    {
+        YoloPlane in = yolo_plane_take(&arena, 1, 5, 13, 11);
+        YoloPlane out = yolo_plane_take(&arena, 1, 7, 7, 6);
+        float *weight = (float *)yolo_arena_take(&arena, 7 * 5 * 9 * sizeof(float));
+        float *bias = (float *)yolo_arena_take(&arena, 7 * sizeof(float));
+        float *room = (float *)yolo_arena_take(&arena,
+            backend->conv_room(&in, &out, 3, 1));
+        float *plain = (float *)yolo_arena_take(&arena,
+            yolo_plane_count(&out) * sizeof(float));
+        int out_channel, in_channel, out_y, out_x, kernel_y, kernel_x;
+
+        for (index = 0; index < (int)yolo_plane_count(&in); index++)
+            in.cell_list[index] = test_real();
+        for (index = 0; index < 7 * 5 * 9; index++) weight[index] = test_real();
+        for (index = 0; index < 7; index++) bias[index] = test_real();
+        backend->conv_run(backend, &in, &out, weight, bias, 3, 2, 1, 1, 1,
+                          YOLO_ACT_NONE, room);
+        for (out_channel = 0; out_channel < 7; out_channel++)
+            for (out_y = 0; out_y < 7; out_y++)
+                for (out_x = 0; out_x < 6; out_x++) {
+                    float total = bias[out_channel];
+                    for (in_channel = 0; in_channel < 5; in_channel++)
+                        for (kernel_y = 0; kernel_y < 3; kernel_y++)
+                            for (kernel_x = 0; kernel_x < 3; kernel_x++) {
+                                int at_y = out_y * 2 - 1 + kernel_y;
+                                int at_x = out_x * 2 - 1 + kernel_x;
+                                if (at_y < 0 || at_y >= 13 || at_x < 0 || at_x >= 11)
+                                    continue;
+                                total += weight[((out_channel * 5 + in_channel) * 3
+                                                 + kernel_y) * 3 + kernel_x]
+                                       * in.cell_list[(in_channel * 13 + at_y) * 11 + at_x];
+                            }
+                    plain[(out_channel * 7 + out_y) * 6 + out_x] = total;
+                }
+        test_case("a strided padded convolution matches a direct one",
+                  test_gap(out.cell_list, plain, (int)yolo_plane_count(&out)) < 1e-5f,
+                  "%.2e", (double)test_gap(out.cell_list, plain,
+                                           (int)yolo_plane_count(&out)));
+    }
+
+    /* the depthwise path, which skips lowering entirely */
+    {
+        YoloPlane in = yolo_plane_take(&arena, 1, 6, 9, 9);
+        YoloPlane deep = yolo_plane_take(&arena, 1, 6, 9, 9);
+        YoloPlane wide = yolo_plane_take(&arena, 1, 6, 9, 9);
+        float *deep_weight = (float *)yolo_arena_take(&arena, 6 * 9 * sizeof(float));
+        float *wide_weight = (float *)yolo_arena_zero(&arena, 6 * 6 * 9 * sizeof(float));
+        float *room;
+        int channel;
+
+        for (index = 0; index < (int)yolo_plane_count(&in); index++)
+            in.cell_list[index] = test_real();
+        for (index = 0; index < 6 * 9; index++) deep_weight[index] = test_real();
+        /* the same convolution written with the groups spelled out */
+        for (channel = 0; channel < 6; channel++)
+            for (index = 0; index < 9; index++)
+                wide_weight[(channel * 6 + channel) * 9 + index] =
+                    deep_weight[channel * 9 + index];
+        room = (float *)yolo_arena_take(&arena,
+            backend->conv_room(&in, &wide, 3, 1));
+        backend->conv_run(backend, &in, &deep, deep_weight, NULL, 3, 1, 1, 1, 6,
+                          YOLO_ACT_NONE, NULL);
+        backend->conv_run(backend, &in, &wide, wide_weight, NULL, 3, 1, 1, 1, 1,
+                          YOLO_ACT_NONE, room);
+        test_case("a depthwise convolution matches the dense one it stands for",
+                  test_gap(deep.cell_list, wide.cell_list,
+                           (int)yolo_plane_count(&deep)) < 1e-5f, "");
+    }
+
+    /* pooling, resizing and softmax */
+    {
+        YoloPlane in = yolo_plane_take(&arena, 1, 2, 4, 4);
+        YoloPlane out = yolo_plane_take(&arena, 1, 2, 4, 4);
+        YoloPlane wide = yolo_plane_take(&arena, 1, 2, 8, 8);
+        for (index = 0; index < (int)yolo_plane_count(&in); index++)
+            in.cell_list[index] = (float)index;
+        backend->pool_run(backend, &in, &out, 5, 1, 2);
+        test_case("a wide pool at stride one keeps the shape and takes the largest",
+                  out.cell_list[0] == 10.0f && out.cell_list[15] == 15.0f,
+                  "%g %g", (double)out.cell_list[0], (double)out.cell_list[15]);
+        backend->resize_run(backend, &in, &wide, 2);
+        test_case("a nearest resize repeats each cell",
+                  wide.cell_list[0] == in.cell_list[0]
+                  && wide.cell_list[1] == in.cell_list[0]
+                  && wide.cell_list[8] == in.cell_list[0]
+                  && wide.cell_list[2] == in.cell_list[1], "");
+    }
+    {
+        float row_list[6] = { 1.0f, 2.0f, 3.0f, 900.0f, 901.0f, 902.0f };
+        float total = 0.0f;
+        backend->softmax_run(backend, row_list, 2, 3);
+        for (index = 0; index < 3; index++) total += row_list[index];
+        test_case("a softmax row sums to one", test_near(total, 1.0f, 1e-6f), "");
+        test_case("a softmax does not overflow on a large row",
+                  row_list[5] > 0.6f && row_list[5] < 0.7f, "%g", (double)row_list[5]);
+        test_case("a shift of the whole row does not move the answer",
+                  test_near(row_list[0], row_list[3], 1e-6f), "");
+    }
+    yolo_arena_close(&arena);
+}
+
+/* The shaping, which is where a parity run goes wrong quietly.  The numbers
+ * here are the two published sample pictures: a portrait one that needs no
+ * padding at all, and a landscape one that needs twelve rows of it. */
+static void test_yolo_shape(void)
+{
+    YoloImage image;
+    YoloFrame frame;
+    int width, height;
+    static uint8_t room[8 * 8 * 3];
+
+    test_open("yolo shaping");
+    memset(&image, 0, sizeof image);
+    image.channel_count = 3;
+    image.pixel_list = room;
+
+    image.width = 810; image.height = 1080;
+    yolo_frame_fit(&image, 640, 32, 1, 1, 1, &frame, &width, &height);
+    test_case("a portrait picture pads to a stride multiple, not a square",
+              width == 480 && height == 640 && frame.pad_left == 0
+              && frame.pad_top == 0, "%dx%d", width, height);
+
+    image.width = 1280; image.height = 720;
+    yolo_frame_fit(&image, 640, 32, 1, 1, 1, &frame, &width, &height);
+    test_case("a landscape picture pads its short side up to the stride",
+              width == 640 && height == 384 && frame.pad_top == 12
+              && frame.pad_left == 0, "%dx%d pad %d", width, height, frame.pad_top);
+    test_case("the scale is the one that fits the longer side",
+              test_near(frame.ratio, 0.5f, 1e-6f), "%g", (double)frame.ratio);
+
+    yolo_frame_fit(&image, 640, 32, 0, 1, 1, &frame, &width, &height);
+    test_case("square mode pads all the way out",
+              width == 640 && height == 640 && frame.pad_top == 140,
+              "%dx%d pad %d", width, height, frame.pad_top);
+
+    image.width = 100; image.height = 100;
+    yolo_frame_fit(&image, 640, 32, 1, 0, 1, &frame, &width, &height);
+    test_case("without scale-up a small picture is left alone",
+              test_near(frame.ratio, 1.0f, 1e-6f) && frame.fit_width == 100, "");
+
+    /* an odd gap is the only case that can tell the reference's rounding from
+     * an ordinary one: it puts the spare row on the bottom, not the top */
+    image.width = 1280; image.height = 726;
+    yolo_frame_fit(&image, 640, 32, 1, 1, 1, &frame, &width, &height);
+    test_case("an odd gap leaves the spare row at the bottom",
+              height == 384 && frame.fit_height == 363 && frame.pad_top == 10,
+              "%dx%d fit %d pad %d", width, height, frame.fit_height,
+              frame.pad_top);
+
+    /* an exact halving is the one case where OpenCV's fixed point reduces to
+     * an average, which is what makes it checkable by hand */
+    {
+        static uint8_t source[4 * 4 * 3];
+        float target[3 * 2 * 2];
+        int index;
+        for (index = 0; index < 4 * 4 * 3; index++) source[index] = (uint8_t)(index * 5);
+        yolo_pixels_scale(source, 4, 4, 12, 3, 0, target, 2, 2, 2, 2, 0, 0, 1.0f);
+        /* the four red cells of the top-left quad are 0, 15, 60, 75 */
+        test_case("a halving averages the four cells it covers",
+                  test_near(target[0], (0 + 15 + 60 + 75 + 2) / 4.0f, 0.51f),
+                  "%g", (double)target[0]);
+        test_case("the channel planes do not run into each other",
+                  target[4] != target[0] && target[8] != target[4], "");
+    }
+}
+
+/* Boxes: the decode, the two overlaps, and the two suppression rules. */
+static void test_yolo_boxes(void)
+{
+    YoloPick pick_list[3];
+    int kept;
+
+    test_open("yolo boxes");
+    {
+        YoloHeadOut head;
+        float box_room[4], anchor_x = 4.5f, anchor_y = 6.5f, stride = 8.0f;
+        float left, top, right, bottom;
+        memset(&head, 0, sizeof head);
+        head.anchor_count = 1;
+        head.box_room = box_room;
+        head.anchor_x_list = &anchor_x;
+        head.anchor_y_list = &anchor_y;
+        head.stride_list = &stride;
+        box_room[0] = 1.0f; box_room[1] = 2.0f; box_room[2] = 3.0f; box_room[3] = 4.0f;
+        yolo_box_decode(&head, 1, 0, &left, &top, &right, &bottom);
+        test_case("a box is four distances from its cell's centre, in pixels",
+                  left == (4.5f - 1.0f) * 8.0f && top == (6.5f - 2.0f) * 8.0f
+                  && right == (4.5f + 3.0f) * 8.0f && bottom == (6.5f + 4.0f) * 8.0f,
+                  "%g %g %g %g", (double)left, (double)top, (double)right,
+                  (double)bottom);
+    }
+    {
+        /* with reg_max above one the branch says a distribution, and the
+         * distance is its mean -- a v8 or v11 checkpoint, not a yolo26 */
+        YoloHeadOut head;
+        float box_room[8];
+        float anchor = 0.5f, stride = 1.0f;
+        int index;
+        memset(&head, 0, sizeof head);
+        head.anchor_count = 1;
+        head.box_room = box_room;
+        head.anchor_x_list = &anchor;
+        head.anchor_y_list = &anchor;
+        head.stride_list = &stride;
+        for (index = 0; index < 8; index++) box_room[index] = 0.0f;
+        box_room[1] = 100.0f;    /* edge zero is certain of bin one */
+        test_case("a distribution over bins becomes its mean distance",
+                  test_near(yolo_edge_value(box_room, 2, 1, 0, 0), 1.0f, 1e-4f),
+                  "%g", (double)yolo_edge_value(box_room, 2, 1, 0, 0));
+        box_room[0] = 100.0f;    /* now it is torn evenly between zero and one */
+        test_case("an even split falls between the bins",
+                  test_near(yolo_edge_value(box_room, 2, 1, 0, 0), 0.5f, 1e-4f), "");
+    }
+    {
+        YoloPick a, b;
+        memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+        a.left = 0.0f; a.top = 0.0f; a.right = 10.0f; a.bottom = 10.0f;
+        b = a;
+        test_case("a box overlaps itself entirely",
+                  test_near(yolo_overlap(&a, &b), 1.0f, 1e-6f), "");
+        b.left = 5.0f; b.right = 15.0f;
+        test_case("a half overlap measures a third",
+                  test_near(yolo_overlap(&a, &b), 50.0f / 150.0f, 1e-6f),
+                  "%g", (double)yolo_overlap(&a, &b));
+        b.left = 20.0f; b.right = 30.0f;
+        test_case("boxes that do not touch overlap not at all",
+                  yolo_overlap(&a, &b) == 0.0f, "");
+    }
+    {
+        /* an oriented pick keeps its centre in left/top and its size in
+         * right/bottom, and the probabilistic overlap is one against itself */
+        YoloPick a, b;
+        memset(&a, 0, sizeof a);
+        a.left = 10.0f; a.top = 10.0f; a.right = 20.0f; a.bottom = 8.0f;
+        a.angle = 0.4f;
+        b = a;
+        test_case("an oriented box overlaps itself entirely",
+                  yolo_rbox_overlap(&a, &b) > 0.999f,
+                  "%g", (double)yolo_rbox_overlap(&a, &b));
+        b.left = 400.0f;
+        test_case("an oriented box far away overlaps not at all",
+                  yolo_rbox_overlap(&a, &b) < 1e-3f, "");
+        b = a;
+        b.angle = a.angle + 1.2f;
+        test_case("turning a box away from another lowers the overlap",
+                  yolo_rbox_overlap(&a, &b) < 0.999f, "");
+    }
+    {
+        /* three boxes in a row, each overlapping the next but not the one
+         * after.  Greedy keeps the first and the third; the matrix rule the
+         * rotated path uses keeps only the first, because the middle box
+         * strikes the third out after being struck out itself. */
+        int index;
+        for (index = 0; index < 3; index++) {
+            memset(&pick_list[index], 0, sizeof pick_list[index]);
+            pick_list[index].left = (float)index * 4.0f;
+            pick_list[index].right = pick_list[index].left + 10.0f;
+            pick_list[index].top = 0.0f;
+            pick_list[index].bottom = 10.0f;
+            pick_list[index].score = 1.0f - (float)index * 0.1f;
+        }
+        kept = yolo_suppress(pick_list, 3, 0.4f, 1, 0, 300);
+        test_case("greedy suppression lets a struck box stop striking",
+                  kept == 2, "%d kept", kept);
+    }
+    {
+        /* three oriented squares in a row, spaced so that each overlaps its
+         * neighbour past the limit -- 0.73 -- and the ends do not, at 0.49.
+         * Greedy would keep the first and the third; the matrix rule keeps
+         * only the first, because the middle one strikes the third out after
+         * being struck out itself. */
+        int index;
+        for (index = 0; index < 3; index++) {
+            memset(&pick_list[index], 0, sizeof pick_list[index]);
+            pick_list[index].left = 10.0f + (float)index * 4.5f;
+            pick_list[index].top = 10.0f;
+            pick_list[index].right = 20.0f;
+            pick_list[index].bottom = 20.0f;
+            pick_list[index].score = 1.0f - (float)index * 0.1f;
+        }
+        test_case("the spacing is on the two sides of the limit it needs to be",
+                  yolo_rbox_overlap(&pick_list[0], &pick_list[1]) > 0.7f
+                  && yolo_rbox_overlap(&pick_list[0], &pick_list[2]) < 0.7f,
+                  "%.3f then %.3f",
+                  (double)yolo_rbox_overlap(&pick_list[0], &pick_list[1]),
+                  (double)yolo_rbox_overlap(&pick_list[0], &pick_list[2]));
+        kept = yolo_suppress(pick_list, 3, 0.7f, 1, 1, 300);
+        test_case("the matrix rule lets a struck box keep striking",
+                  kept == 1, "%d kept", kept);
+    }
+    {
+        int index;
+        for (index = 0; index < 2; index++) {
+            memset(&pick_list[index], 0, sizeof pick_list[index]);
+            pick_list[index].left = 0.0f; pick_list[index].top = 0.0f;
+            pick_list[index].right = 10.0f; pick_list[index].bottom = 10.0f;
+            pick_list[index].score = 1.0f - (float)index * 0.1f;
+            pick_list[index].class_index = index;
+        }
+        kept = yolo_suppress(pick_list, 2, 0.5f, 0, 0, 300);
+        test_case("two classes on one box both survive", kept == 2, "%d kept", kept);
+        kept = yolo_suppress(pick_list, 2, 0.5f, 1, 0, 300);
+        test_case("asked to be class-blind, only the better one survives",
+                  kept == 1, "%d kept", kept);
+    }
+}
+
+/* The pickle reader, on bytes written here rather than on a checkpoint.  Every
+ * opcode a torch checkpoint uses is protocol two, so these are the real ones. */
+static void test_yolo_pickle(void)
+{
+    YoloArena arena;
+    YoloValue *value = NULL;
+    YoloStatus status;
+
+    test_open("yolo pickle");
+    yolo_arena_open(&arena, 1 << 16);
+
+    {
+        /* }q\0(X\3\0\0\0keyK\7u.  -- {"key": 7} */
+        static const unsigned char byte_list[] = {
+            0x80, 0x02, '}', 'q', 0x00, '(',
+            'X', 3, 0, 0, 0, 'k', 'e', 'y', 'K', 7, 'u', '.'
+        };
+        status = yolo_pickle_run(&arena, byte_list, sizeof byte_list, &value);
+        test_case("a dict with one entry reads back",
+                  status == YOLO_OK && value && value->kind == YOLO_VALUE_DICT
+                  && yolo_value_number(yolo_value_find(value, "key"), -1) == 7,
+                  "%s", yolo_status_text(status));
+    }
+    {
+        /* a list of three ints, built through a mark and APPENDS */
+        static const unsigned char byte_list[] = {
+            0x80, 0x02, ']', 'q', 0x00, '(', 'K', 1, 'K', 2, 'M', 0x01, 0x01,
+            'e', '.'
+        };
+        status = yolo_pickle_run(&arena, byte_list, sizeof byte_list, &value);
+        test_case("a list keeps its order and its widths",
+                  status == YOLO_OK && value && value->item_count == 3
+                  && yolo_value_number(yolo_value_at(value, 0), 0) == 1
+                  && yolo_value_number(yolo_value_at(value, 2), 0) == 257,
+                  "%s", yolo_status_text(status));
+    }
+    {
+        /* a memo read: put a string, then get it back */
+        static const unsigned char byte_list[] = {
+            0x80, 0x02, ']', 'q', 0x00, '(',
+            'X', 2, 0, 0, 0, 'h', 'i', 'q', 0x05, 'h', 0x05, 'e', '.'
+        };
+        status = yolo_pickle_run(&arena, byte_list, sizeof byte_list, &value);
+        test_case("a value stored in the memo can be read back twice",
+                  status == YOLO_OK && value && value->item_count == 2
+                  && yolo_value_is(yolo_value_at(value, 0), "hi")
+                  && yolo_value_at(value, 0) == yolo_value_at(value, 1),
+                  "%s", yolo_status_text(status));
+    }
+    {
+        /* a global that is called: collections.OrderedDict becomes a dict */
+        static const unsigned char byte_list[] = {
+            0x80, 0x02, 'c', 'c', 'o', 'l', 'l', 'e', 'c', 't', 'i', 'o', 'n',
+            's', '\n', 'O', 'r', 'd', 'e', 'r', 'e', 'd', 'D', 'i', 'c', 't',
+            '\n', 'q', 0x00, ')', 'R', 'q', 0x01, '.'
+        };
+        status = yolo_pickle_run(&arena, byte_list, sizeof byte_list, &value);
+        test_case("an ordered dict becomes a dict rather than an object",
+                  status == YOLO_OK && value && value->kind == YOLO_VALUE_DICT,
+                  "%s", yolo_status_text(status));
+    }
+    {
+        /* an opcode this engine does not read is a refusal, not a guess */
+        static const unsigned char byte_list[] = { 0x80, 0x02, 'I', '1', '\n', '.' };
+        status = yolo_pickle_run(&arena, byte_list, sizeof byte_list, &value);
+        test_case("an unread opcode is refused and named",
+                  status == YOLO_ERR_FORMAT && strstr(yolo_detail_text(), "0x49"),
+                  "%s", yolo_detail_text());
+    }
+    {
+        static const unsigned char byte_list[] = { 0x80, 0x02, 'K' };
+        status = yolo_pickle_run(&arena, byte_list, sizeof byte_list, &value);
+        test_case("a pickle that ends mid-opcode is refused",
+                  status == YOLO_ERR_FORMAT, "%s", yolo_status_text(status));
+    }
+    test_case("a missing checkpoint is refused rather than crashed into",
+              yolo_model_open("this/does/not/exist.pt", NULL) == YOLO_ERR_ARG, "");
+    {
+        YoloModel *model = NULL;
+        test_case("a path that is not there reports the file, not the format",
+                  yolo_model_open("this/does/not/exist.pt", &model) == YOLO_ERR_FILE
+                  && model == NULL, "");
+    }
+    yolo_arena_close(&arena);
+}
+
+/* Reading and writing a picture without a library, which is what the rest of
+ * this suite's media is made of. */
+static void test_yolo_picture(void)
+{
+    YoloImage wrote, read;
+    uint8_t room[3 * 2 * 3];
+    const char *path = "build/test_yolo.ppm";
+    int index;
+
+    test_open("yolo pictures");
+    for (index = 0; index < 3 * 2 * 3; index++) room[index] = (uint8_t)(index * 9);
+    memset(&wrote, 0, sizeof wrote);
+    test_case("a caller's pixels can be wrapped without a copy",
+              yolo_image_wrap(room, 3, 2, 3, &wrote) == YOLO_OK
+              && wrote.pixel_list == room && wrote.owned_flag == 0, "");
+    if (yolo_image_write(path, &wrote) == YOLO_OK) {
+        memset(&read, 0, sizeof read);
+        test_case("a written picture reads back the same",
+                  yolo_image_read(path, &read) == YOLO_OK
+                  && read.width == 3 && read.height == 2
+                  && read.channel_count == 3
+                  && memcmp(read.pixel_list, room, sizeof room) == 0, "");
+        yolo_image_free(&read);
+        test_case("freeing a picture leaves nothing behind",
+                  read.pixel_list == NULL && read.width == 0, "");
+    } else {
+        test_case("a written picture reads back the same", 0, "could not write");
+        test_case("freeing a picture leaves nothing behind", 0, "could not write");
+    }
+    yolo_image_free(&wrote);
+    test_case("freeing a wrapped picture does not free the caller's memory",
+              room[0] == 0 && room[1] == 9, "");
+}
+
 /* -- entry ----------------------------------------------------------------- */
 
 int main(void)
@@ -1091,6 +1627,13 @@ int main(void)
     test_vocab();
     test_sampler();
     test_paths();
+    test_yolo_numbers();
+    test_yolo_arena();
+    test_yolo_kernels();
+    test_yolo_shape();
+    test_yolo_boxes();
+    test_yolo_pickle();
+    test_yolo_picture();
 
     printf("\n%d checks, %d failed, %.2fs\n", test_ran, test_bad, ill_clock_now() - mark);
     return test_bad ? 1 : 0;

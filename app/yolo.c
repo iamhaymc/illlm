@@ -444,7 +444,8 @@ typedef struct YoloBlock {
     struct YoloBlock *next;
     size_t            size;
     size_t            used;
-    unsigned char    *byte_list;
+    unsigned char    *byte_list;   /* the aligned start */
+    unsigned char    *raw_list;    /* what malloc returned, for the free */
 } YoloBlock;
 
 typedef struct {
@@ -471,28 +472,36 @@ static void yolo_arena_close(YoloArena *arena)
     YoloBlock *block = arena->block_list;
     while (block) {
         YoloBlock *next = block->next;
-        free(block->byte_list);
+        free(block->raw_list);
         free(block);
         block = next;
     }
     memset(arena, 0, sizeof *arena);
 }
 
+#define YOLO_ALIGN 64
+
 static void *yolo_arena_take(YoloArena *arena, size_t size)
 {
-    size_t want = (size + 63u) & ~(size_t)63;   /* keep every row cache aligned */
+    /* every take is a multiple of a cache line and starts on one: the kernels
+     * below read a plane's rows with vector loads, and a block whose base came
+     * straight from malloc is aligned to sixteen bytes at best */
+    size_t want = (size + (YOLO_ALIGN - 1)) & ~(size_t)(YOLO_ALIGN - 1);
     YoloBlock *block = arena->block_list;
     void *cell;
 
-    if (want == 0) want = 64;
+    if (want == 0) want = YOLO_ALIGN;
     if (!block || block->used + want > block->size) {
         size_t fresh = arena->block_size;
         YoloBlock *made;
         while (fresh < want) fresh *= 2;
         made = (YoloBlock *)calloc(1, sizeof *made);
         if (!made) return NULL;
-        made->byte_list = (unsigned char *)malloc(fresh);
-        if (!made->byte_list) { free(made); return NULL; }
+        made->raw_list = (unsigned char *)malloc(fresh + YOLO_ALIGN);
+        if (!made->raw_list) { free(made); return NULL; }
+        made->byte_list = (unsigned char *)
+            (((uintptr_t)made->raw_list + (YOLO_ALIGN - 1))
+             & ~(uintptr_t)(YOLO_ALIGN - 1));
         made->size = fresh;
         made->used = 0;
         made->next = arena->block_list;
