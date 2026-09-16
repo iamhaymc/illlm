@@ -26,13 +26,21 @@ answer at `full`. The level is a system prompt - `Caveman mode: full.`,
 a permanent change of voice, and `Normal mode.` rows are carried in the
 corpus so the knob has an off position that still works.
 
-Five steps, each needing only what the one before it produced:
+Six steps, each needing only what the one before it produced. `--uncensor` is
+the one that is optional -- the tune runs with it or without it -- and every
+step after it reads what it wrote:
 
     python3 app_tune.py --lint                                  audit the corpus
     python3 app_tune.py --make-data --source raw.jsonl          grow the corpus
+    python3 app_tune.py --model model --uncensor                abliterate refusals
     python3 app_tune.py --model model --train
     python3 app_tune.py --model model --merge
     python3 app_tune.py --model model --check --tuned build/tune/merged
+
+They also compose, which is the point of the chaining: one command takes the
+published weights to a decensored, tuned checkpoint with nobody watching it.
+
+    python3 app_tune.py --model model --uncensor --train --merge
 
 `--train` writes `build/tune/adapter` (the PEFT adapter) and `build/tune/`
 (its trainer state). `--merge` folds the adapter into the base weights and
@@ -145,9 +153,67 @@ the content. Three things push back, in increasing cost:
     rather than taking this ratio. It is a flag and not the default for that
     reason. Use it when `--check` says the answers are drifting.
 
+Uncensoring the weights first
+-----------------------------
+
+`--uncensor` runs heretic (<https://github.com/p-e-w/heretic>) over the
+checkpoint before anything trains and writes the decensored weights to
+`build/tune/uncensored`, in the same layout as `model/`. It is not a tune and
+shares no mechanism with one: no gradient step and no corpus, but a low rank
+edit that subtracts the direction the residual stream moves in when the model
+is about to refuse. That direction is measured over 400 harmless and 400
+harmful prompts, applied per layer at a weight an Optuna search picks, and the
+search is scored on two numbers at once -- how many of a hundred held out
+harmful prompts still draw a refusal, and how far the first token distribution
+has moved from the base on a hundred harmless ones.
+
+Heretic already knows this architecture. It reaches `conv.out_proj`,
+`self_attn.out_proj` and `feed_forward.w2` -- every sheet that writes back into
+the residual stream on either operator, over all thirty blocks -- so nothing
+here has to teach it where to cut. What is this checkpoint's rather than
+heretic's is the settings, and two of them matter:
+
+  - **The response prefix is `</think>`.** LFM2.5's template ends a generation
+    prompt with `<think>`, so the first token of a reply is the first token of
+    the reasoning. Heretic skips a think block by spotting a generated
+    `<think>` and replacing it with a closed one, which cannot fire on a
+    template that has already opened the block -- so without this, refusals are
+    counted over thinking text, where `harmful`, `illegal` and `violat`, three
+    of the refusal markers, are exactly what a thought reasoning about a
+    request says, and the divergence is measured at the first token of a
+    thought rather than of an answer. Closing the block in the prompt puts both
+    back on the answer. The prefix carries no newline because this checkpoint
+    writes none: greedy from `model/`, it produces
+    `...concisely.</think>Here are three practical tips`.
+  - **`--uncensor-kl 0.25` is a ceiling on what may be exported**, and the
+    divergence heretic balances its two objectives at is set to the same
+    number, so the search spends its trials in the band a trial can actually be
+    taken from instead of treating 1.0 as typical. The cap is chosen rather
+    than measured -- heretic's own note puts visible damage above 0.5, this
+    checkpoint is 2.6B and has less to spare than the models that note came
+    from, and an adapter trains over whatever comes out and spends accuracy of
+    its own.
+
+Nothing is asked of whoever starts it. Heretic ends at a menu -- which point of
+the Pareto front, then what to do with it -- and 1.4.0 has a flag for neither,
+so its prompts are answered for the length of the run from the shape of the
+choices: the fewest refusals among the trials under the cap, save, exit. A run
+that stops halfway leaves an optuna checkpoint under `build/tune/uncensor-study`
+and the next `--uncensor` resumes it rather than starting again, which also
+means a finished study re-exports in seconds; `--uncensor-fresh` throws it away.
+
+Two things it does not do. It does not tell a warning from a refusal --
+`disclaimer` and `harmful` are refusal markers, and the corpus' `guard` rows
+are full sentences warning about destructive operations, so the register's own
+warnings come back from the adapter that trains afterwards rather than
+surviving the edit. And it has no number here: no abliteration has been run
+over the 2.6B weights, because that needs a card and this repository's hosts
+are processors. `TODO.md` carries the item.
+
 When torch, transformers or peft are missing, the script reports what it
-skipped and exits zero, so it stays usable inside a build pipeline. The rule
-engine, the corpus loader and `--lint` need none of them and always run.
+skipped and exits zero, so it stays usable inside a build pipeline; `heretic`
+is reported the same way, and only `--uncensor` needs it. The rule engine, the
+corpus loader and `--lint` need none of them and always run.
 """
 
 import argparse
@@ -161,6 +227,8 @@ ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
 TUNE_PATH = os.path.join(ROOT_PATH, "build", "tune")
 ADAPTER_PATH = os.path.join(TUNE_PATH, "adapter")
 MERGED_PATH = os.path.join(TUNE_PATH, "merged")
+UNCENSOR_PATH = os.path.join(TUNE_PATH, "uncensored")
+UNCENSOR_STUDY = os.path.join(TUNE_PATH, "uncensor-study")
 DATA_PATH = os.path.join(ROOT_PATH, "data_tune.jsonl")
 
 # A style change is a small change, and the corpus is a few hundred rows of it.
@@ -177,6 +245,16 @@ LORA_RANK = 32
 LORA_ALPHA = 64
 LORA_DROP = 0.05
 EVAL_SHARE = 0.1         # rows held out when a row does not name its own split
+
+# The abliteration, which runs before the tune and is heretic's work rather
+# than this script's. Two hundred trials at sixty random ones is heretic's own
+# ratio and is left alone; the rest are this checkpoint's, and `uncensor_argv`
+# says why each is what it is.
+UNCENSOR_TRIALS = 200
+UNCENSOR_START = 60
+UNCENSOR_KL = 0.25       # most divergence from the base an exported trial may carry
+UNCENSOR_PREFIX = "</think>"
+UNCENSOR_SHARD = "1900MB"
 
 # Every linear sheet in a block, and nothing else. `conv.conv` is the depthwise
 # kernel and is not a linear layer; the norms are gains, not sheets. PEFT reads
@@ -900,6 +978,253 @@ def lint_data(data_path):
 
 
 # ---------------------------------------------------------------------------
+# the abliteration
+#
+# Uncensoring is not a tune and does not share a mechanism with one: no
+# gradient step, no corpus, a low rank edit of the weights that subtracts the
+# direction the residual stream moves in when the model is about to refuse.
+# Heretic does that work; everything in this section is about driving it with
+# nobody at the keyboard.
+# ---------------------------------------------------------------------------
+
+def need_heretic():
+    """Imports what an abliteration needs, or prints what is missing."""
+    try:
+        import heretic.main  # noqa: F401
+    except ImportError as miss:
+        print("skip: %s; pip install heretic-llm" % miss)
+        return None
+    return True
+
+
+def carry_leaves(model_path, out_path):
+    """Copies the template and the generation defaults across when a save did not.
+
+    `save_pretrained` writes them only when the object it is called on holds
+    them, so anything the base had and the copy lacks is carried across by
+    hand. The template is what shapes a prompt; without it the reference falls
+    back to a default that does not open the think block, and the shape the
+    tune trains into goes with it."""
+    import shutil
+    for leaf in ("chat_template.jinja", "generation_config.json"):
+        was = os.path.join(model_path, leaf)
+        now = os.path.join(out_path, leaf)
+        if os.path.isfile(was) and not os.path.isfile(now):
+            shutil.copyfile(was, now)
+
+
+def uncensor_argv(model_path, flag):
+    """The heretic command line this checkpoint wants.
+
+    Heretic takes its settings from, in falling precedence, the command line,
+    `HERETIC_` environment variables, and a `config.toml` in the working
+    directory. Everything that matters is passed as argv so that a stray
+    config file beside the repository cannot quietly change what a run does.
+
+    Four of these are this checkpoint's rather than heretic's defaults:
+
+      - `--response-prefix </think>`. LFM2.5's template ends a generation
+        prompt with `<think>`, so the first token of a reply is the first token
+        of the reasoning. Heretic skips a think block by spotting a generated
+        `<think>` and replacing it with a closed one, which cannot fire on a
+        template that already opened it, so without this the refusal count is
+        taken over thinking text -- where `harmful`, `illegal` and `violat`,
+        three of the refusal markers, are what a thought reasoning about a
+        request says -- and the divergence is measured at the first token of a
+        thought. Closing the block in the prompt puts both back on the answer.
+        No trailing newline: this checkpoint writes none, and greedy from
+        `model/` produces `...concisely.</think>Here are three practical tips`.
+      - `--kl-divergence-scale` follows `--uncensor-kl`. The scale is the
+        divergence heretic treats as typical when it balances its two
+        objectives against each other; leaving it at 1.0 while exporting only
+        trials at or under 0.25 spends the search on a band nothing can be
+        taken from.
+      - `--max-shard-size 1900MB`, the same cap `--merge` writes under, so the
+        result can be committed the way `model/` is: two gigabytes is the
+        limit for one LFS object.
+      - `--export-strategy merge`, because the engine reads a plain checkpoint
+        and has no idea what a PEFT adapter is.
+
+    The startup trials stay at heretic's ratio rather than its count. Sixty
+    random trials of two hundred is thirty per cent; sixty of forty is every
+    trial, and the TPE sampler would never get a turn. Where heretic wants a
+    folder to save into it asks rather than reading a setting, so the output
+    path is not here -- it is answered by the hand below."""
+    return [
+        "heretic",
+        "--model", model_path,
+        "--seed", str(flag.seed),
+        "--response-prefix", UNCENSOR_PREFIX,
+        "--kl-divergence-scale", str(flag.uncensor_kl),
+        "--n-trials", str(flag.uncensor_trials),
+        "--n-startup-trials", str(min(UNCENSOR_START,
+                                      max(1, flag.uncensor_trials // 3))),
+        "--batch-size", str(flag.uncensor_batch),
+        "--quantization", flag.uncensor_quant,
+        "--export-strategy", "merge",
+        "--max-shard-size", UNCENSOR_SHARD,
+        "--study-checkpoint-dir", UNCENSOR_STUDY,
+    ]
+
+
+def uncensor_pick(trial_list, cap):
+    """The trial an unattended run exports.
+
+    Heretic finishes with the Pareto front of refusal count against KL
+    divergence from the base, and asks which point on it to keep: the one
+    judgement in the process. The fewest refusals sit at the divergent end of
+    that front, so taking the best refusal count alone hands back the most
+    damaged model on offer. This takes the fewest refusals among the trials at
+    or under `cap`, and the least divergent of those where they tie.
+
+    `cap` is chosen, not measured. Heretic's own note puts visible damage
+    above 0.5; this checkpoint is 2.6B and has less to spare than the models
+    that note came from, and an adapter trains over whatever comes out and
+    spends accuracy of its own. `--check` is where a cap set too high shows
+    up, which is the reason that pass exists."""
+    fit_list = [trial for trial in trial_list
+                if trial.user_attrs["kl_divergence"] <= cap]
+    if not fit_list:
+        # Nothing on the front is exportable, so the run has not decensored
+        # anything within budget. Take the least damaged rather than the
+        # fewest refusals: raising the cap is a decision for whoever reads
+        # these numbers, not one to make silently by taking the far end.
+        print("  no trial came in under a divergence of %.3f; taking the least "
+              "divergent of the %d on the front, and refusals with it"
+              % (cap, len(trial_list)))
+        return min(trial_list, key=lambda trial: trial.user_attrs["kl_divergence"])
+    return min(fit_list, key=lambda trial: (trial.user_attrs["refusals"],
+                                            trial.user_attrs["kl_divergence"]))
+
+
+def uncensor_hand(out_path, cap, fresh):
+    """Answers heretic's own prompts, so a run needs nobody at the keyboard.
+
+    Heretic is interactive at both ends: it asks what to do about a previous
+    run's checkpoint, which trial to keep, and what to do with the model once
+    that trial is restored. Version 1.4.0 has a flag for none of the three, so
+    its four prompt helpers are replaced for the length of the run.
+
+    The answers are chosen by the **shape of the choices rather than the
+    wording of the question**: the trial menu is the one whose choices carry
+    optuna trials, the resume menu the one offering `continue` beside
+    `restart`. A version that rewords a question still gets the right answer,
+    where matching on the text would fall through to `exit` and throw away the
+    run that had just finished. A question this does not recognise is answered
+    with the empty string, which is cancel in every one of heretic's menus,
+    and is printed on the way out: a silent exit after two hundred trials is
+    not something a user should have to diagnose."""
+    state = {"saved": False}
+
+    def select(message, choices):
+        value_list = [getattr(choice, "value", choice) for choice in choices]
+
+        # The trial menu. An optuna trial is the only thing in any of heretic's
+        # menus carrying user attributes.
+        trial_list = [value for value in value_list
+                      if hasattr(value, "user_attrs")]
+        if trial_list:
+            if state["saved"]:
+                # The checkpoint is written; leave rather than export it twice.
+                return ""
+            trial = uncensor_pick(trial_list, cap)
+            note = trial.user_attrs
+            print("  taking trial %d from the %d on the front: %d refusals of %d "
+                  "against the base's %d, divergence %.4f"
+                  % (note["index"], len(trial_list), note["refusals"],
+                     note["n_bad_prompts"], note["base_refusals"],
+                     note["kl_divergence"]))
+            return trial
+
+        # The resume menu, shown when a previous run left a study checkpoint.
+        # Continuing is the point of that checkpoint: a finished study exports
+        # again in seconds, an interrupted one picks up where it stopped.
+        if "continue" in value_list:
+            return "restart" if fresh and "restart" in value_list else "continue"
+
+        # The export menu, which --export-strategy answers before it is asked.
+        # This is here for a version that asks anyway.
+        if "merge" in value_list:
+            return "merge"
+
+        # The action menu. Save once, then leave; upload, chat and benchmark
+        # are all things an unattended run has no business picking.
+        for value in value_list:
+            if isinstance(value, str) and "save" in value.lower():
+                if state["saved"]:
+                    return ""
+                state["saved"] = True
+                return value
+
+        print("  heretic asked something this script cannot answer, and was "
+              "told to cancel: %s" % message)
+        return ""
+
+    def path(message):
+        _ = message
+        return out_path
+
+    def text(message, *spare, **more):
+        # The only text prompt an unattended run can reach is the count of
+        # additional trials, and empty means none of them.
+        _ = (message, spare, more)
+        return ""
+
+    def secret(message):
+        # Reached only by the upload action, which is never picked.
+        _ = message
+        return ""
+
+    return {"select": select, "path": path, "text": text, "secret": secret}
+
+
+def uncensor_step(model_path, out_path, flag):
+    """Abliterates the refusal direction out of the checkpoint.
+
+    Heretic's own `run` does the work -- loading the model, measuring the
+    per layer refusal directions over 400 harmless and 400 harmful prompts,
+    searching the ablation weights, restoring the chosen trial and writing the
+    merged checkpoint -- because a copy of it here would be a second
+    implementation of somebody else's arithmetic to keep in step with theirs.
+    What this adds is the command line it is given, the hand that answers its
+    prompts, and putting back the global state it changes on the way out.
+
+    Heretic already knows this architecture: it reaches `conv.out_proj`,
+    `self_attn.out_proj` and `feed_forward.w2`, which is every sheet that
+    writes back into the residual stream on either operator, over all thirty of
+    this checkpoint's blocks. Nothing here has to teach it where to cut."""
+    import torch
+    from heretic import main as heretic_main
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    hand = uncensor_hand(out_path, flag.uncensor_kl, flag.uncensor_fresh)
+    argv_was = sys.argv
+    # Heretic only ever runs a forward pass, so it turns gradients off for the
+    # whole process. A --train in the same run would then take steps that
+    # compute nothing, which is why this is restored rather than left.
+    grad_was = torch.is_grad_enabled()
+    kept = (heretic_main.prompt_select, heretic_main.prompt_path,
+            heretic_main.prompt_text, heretic_main.prompt_password)
+    sys.argv = uncensor_argv(model_path, flag)
+    heretic_main.prompt_select = hand["select"]
+    heretic_main.prompt_path = hand["path"]
+    heretic_main.prompt_text = hand["text"]
+    heretic_main.prompt_password = hand["secret"]
+    try:
+        heretic_main.run()
+    finally:
+        sys.argv = argv_was
+        torch.set_grad_enabled(grad_was)
+        (heretic_main.prompt_select, heretic_main.prompt_path,
+         heretic_main.prompt_text, heretic_main.prompt_password) = kept
+
+    if not os.path.isfile(os.path.join(out_path, "config.json")):
+        return None
+    carry_leaves(model_path, out_path)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # the tune
 # ---------------------------------------------------------------------------
 
@@ -1123,7 +1448,6 @@ def merge_step(model_path, adapter_path, out_path):
     would double a checkpoint nobody asked to grow. Shards are capped under
     two gigabytes, which is the limit a single LFS object may have, so a
     merged checkpoint can be committed the way `model/` is."""
-    import shutil
     import torch
     from peft import PeftModel
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -1140,14 +1464,7 @@ def merge_step(model_path, adapter_path, out_path):
     model.save_pretrained(out_path, safe_serialization=True, max_shard_size="1900MB")
     book = AutoTokenizer.from_pretrained(model_path)
     book.save_pretrained(out_path)
-    # The template and the generation defaults are what the reference reads to
-    # shape a prompt. save_pretrained writes them only when it holds them, so
-    # anything the base had and the copy lacks is carried across by hand.
-    for leaf in ("chat_template.jinja", "generation_config.json"):
-        was = os.path.join(model_path, leaf)
-        now = os.path.join(out_path, leaf)
-        if os.path.isfile(was) and not os.path.isfile(now):
-            shutil.copyfile(was, now)
+    carry_leaves(model_path, out_path)
     return out_path
 
 
@@ -1286,6 +1603,22 @@ def main():
                         help="least a row must shrink to be worth keeping")
     parser.add_argument("--limit", type=int, default=0,
                         help="stop after this many source rows; 0 reads them all")
+    parser.add_argument("--uncensor", action="store_true",
+                        help="abliterate refusals out of the checkpoint into %s"
+                             % UNCENSOR_PATH)
+    parser.add_argument("--uncensor-out", default=UNCENSOR_PATH,
+                        help="where --uncensor writes the decensored checkpoint")
+    parser.add_argument("--uncensor-trials", type=int, default=UNCENSOR_TRIALS,
+                        help="ablation trials --uncensor searches over")
+    parser.add_argument("--uncensor-kl", type=float, default=UNCENSOR_KL,
+                        help="most divergence from the base an exported trial may carry")
+    parser.add_argument("--uncensor-batch", type=int, default=0,
+                        help="sequences --uncensor scores in parallel; 0 measures it")
+    parser.add_argument("--uncensor-quant", default="none",
+                        choices=("none", "bnb_4bit"),
+                        help="load the weights 4-bit, to fit --uncensor on a smaller card")
+    parser.add_argument("--uncensor-fresh", action="store_true",
+                        help="ignore an interrupted --uncensor run rather than resuming it")
     parser.add_argument("--train", action="store_true",
                         help="train a LoRA adapter into %s" % ADAPTER_PATH)
     parser.add_argument("--merge", action="store_true",
@@ -1319,8 +1652,10 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
 
-    if not any((flag.lint, flag.make_data, flag.train, flag.merge, flag.check)):
-        print("nothing to do: pass --lint, --make-data, --train, --merge or --check")
+    if not any((flag.lint, flag.make_data, flag.uncensor, flag.train,
+                flag.merge, flag.check)):
+        print("nothing to do: pass --lint, --make-data, --uncensor, --train, "
+              "--merge or --check")
         return 0
 
     # The rule engine needs nothing installed, so the audit and the press run
@@ -1342,10 +1677,30 @@ def main():
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         make_data(flag.source, out_path, flag.think_level, flag.reply_level,
                   flag.floor, flag.limit)
-    if not (flag.train or flag.merge or flag.check):
+    if not (flag.uncensor or flag.train or flag.merge or flag.check):
         return 0
     if not need_modules():
         return 0
+
+    if flag.uncensor:
+        if not flag.model or not os.path.isdir(flag.model):
+            print("skip: no checkpoint folder given; pass --model or set INFERLIQU_MODEL")
+            return 0
+        if not need_heretic():
+            return 0
+        made = uncensor_step(flag.model, flag.uncensor_out, flag)
+        if not made:
+            print("skip: the abliteration wrote no checkpoint to %s"
+                  % flag.uncensor_out)
+            return 0
+        print("uncensored checkpoint written to %s" % made)
+        # Every step after this one reads the decensored weights as its base,
+        # so `--uncensor --train --merge` is one command and the adapter trains
+        # over what will actually be served. --check compares against the same
+        # base the adapter saw, which is the comparison that means anything:
+        # measured against the original it would be reporting the abliteration
+        # and the register together as one number.
+        flag.model = made
 
     if flag.train:
         if not flag.model or not os.path.isdir(flag.model):

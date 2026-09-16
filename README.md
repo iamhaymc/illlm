@@ -13,7 +13,8 @@ app_core.c    the engine, with a clean public API
 app_main.c    the command line
 app_test.c    unit tests for the engine internals
 app_test.py   comparison against the reference implementation
-app_tune.py   fine tuning on the reference side, and the caveman rule engine
+app_tune.py   fine tuning on the reference side, the caveman rule engine,
+              and the heretic abliteration pass
 data_tune.jsonl  the tuning corpus, 202 rows
 run.py        workflows: install, build, test, run
 model/        the published LFM2.5-2.6B checkpoint, used by the test suite
@@ -130,6 +131,7 @@ levels in the corpus, counted with the checkpoint's own tokenizer.
 
 ```sh
 python3 app_tune.py --lint                       # audit the corpus
+python3 app_tune.py --model model --uncensor     # abliterate into build/tune/uncensored
 python3 app_tune.py --model model --train        # LoRA adapter into build/tune
 python3 app_tune.py --model model --merge        # fold it into build/tune/merged
 python3 app_tune.py --model model --check --tuned build/tune/merged
@@ -141,6 +143,39 @@ beside how many answers survived. `--make-data` presses an existing reasoning
 dataset into the register by deleting function words only, and throws away any
 row where a guarded span, a number or a negation moved — a transform that can
 only delete cannot introduce a claim the source did not make.
+
+`--uncensor` is the one step that is not a tune. It runs
+[heretic](https://github.com/p-e-w/heretic) over the checkpoint — no gradient
+step and no corpus, but a low rank edit subtracting the direction the residual
+stream moves in when the model is about to refuse — and writes the decensored
+weights to `build/tune/uncensored` in the same layout as `model/`, so the engine
+reads them unchanged. It needs `pip install heretic-llm`, and it needs a card:
+the search scores a hundred generations and a hundred forward passes per trial,
+two hundred trials by default.
+
+Nothing is asked while it runs. Heretic is interactive at the end — which point
+of the refusals-against-divergence front to keep, and what to do with it — and
+those prompts are answered from the script: the fewest refusals among the trials
+at or under `--uncensor-kl` (0.25 of divergence from the base by default), saved,
+exit. An interrupted run resumes from `build/tune/uncensor-study` rather than
+starting again, and `--uncensor-fresh` throws that away instead;
+`--uncensor-trials` shortens the search, `--uncensor-quant bnb_4bit` loads the
+weights 4-bit for a smaller card, and `--uncensor-out` writes somewhere else.
+The steps chain, so the whole thing is one command:
+
+```sh
+python3 app_tune.py --model model --uncensor --train --merge
+```
+
+The adapter then trains over the decensored weights rather than over the base,
+which is what will be served. Two settings are this checkpoint's rather than
+heretic's, and `app_tune.py`'s header says why: the response prefix is
+`</think>`, because LFM2.5's template has already opened the think block and
+refusals would otherwise be counted over reasoning text; and the divergence
+heretic balances its two objectives at follows the export cap, so the search
+spends its trials in the band a trial can be taken from. No abliteration has
+been run over the 2.6B weights yet — that needs a card, and `TODO.md` carries
+the item.
 
 ## Extending it to an accelerator
 
