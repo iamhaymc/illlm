@@ -13,6 +13,8 @@ app_core.c    the engine, with a clean public API
 app_main.c    the command line
 app_test.c    unit tests for the engine internals
 app_test.py   comparison against the reference implementation
+app_tune.py   fine tuning on the reference side, and the caveman rule engine
+data_tune.jsonl  the tuning corpus, 202 rows
 run.py        workflows: install, build, test, run
 model/        the published LFM2.5-2.6B checkpoint, used by the test suite
 GUIDE.md      a tour of how it all works
@@ -100,6 +102,45 @@ vocabulary 65536 — on four x86-64 cores with AVX-512:
 Decode scales 2.4 → 4.6 → 8.9 tok/s across one, two, and four threads. Loading
 bf16 costs about a tenth of a second because the weights are memory mapped and
 never copied; repacking to q8 costs about three seconds once.
+
+## Tuning
+
+The engine has no trainer. A tune happens on the reference side and comes back
+as a checkpoint the engine reads unchanged: `app_tune.py` trains a LoRA adapter
+over the frozen base, folds it into the float weights, and writes
+`build/tune/merged` in the same layout as `model/`.
+
+What it tunes for is **caveman**, the compression register described by the
+skill at <https://github.com/JuliusBrussee/caveman>: drop articles, filler,
+hedging and pleasantries, and keep every technical fact, every number, every
+negation and every byte of code. LFM2.5 is a thinking model — its chat template
+ends every generation prompt with `<think>` — so the tune trains the reasoning
+span as well as the answer, at separate intensities. The level is a system
+prompt, so the register is a knob rather than a change of voice:
+
+| | thought | answer | whole reply |
+| --- | --- | --- | --- |
+| `Normal mode.` | 19 | 113 | 132 tokens |
+| `Caveman mode: lite.` | 21 | 37 | 58, 2.3x off |
+| `Caveman mode: full.` | 28 | 26 | 54, 2.4x off |
+| `Caveman mode: ultra.` | 10 | 12 | 22, 6.0x off |
+
+One question — "Explain database connection pooling" — carried at all four
+levels in the corpus, counted with the checkpoint's own tokenizer.
+
+```sh
+python3 app_tune.py --lint                       # audit the corpus
+python3 app_tune.py --model model --train        # LoRA adapter into build/tune
+python3 app_tune.py --model model --merge        # fold it into build/tune/merged
+python3 app_tune.py --model model --check --tuned build/tune/merged
+```
+
+`--check` is the number that says whether it worked: it runs the base and the
+tuned checkpoint over the held out rows and reports how far the output shrank
+beside how many answers survived. `--make-data` presses an existing reasoning
+dataset into the register by deleting function words only, and throws away any
+row where a guarded span, a number or a negation moved — a transform that can
+only delete cannot introduce a claim the source did not make.
 
 ## Extending it to an accelerator
 
