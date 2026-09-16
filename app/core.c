@@ -96,6 +96,7 @@ typedef enum IllType {
     ILL_TYPE_F16,
     ILL_TYPE_BF16,
     ILL_TYPE_Q8,        /* 32 value blocks, one f32 scale per block         */
+    ILL_TYPE_Q4,        /* the same blocks at half the width, two to a byte */
     ILL_TYPE_COUNT
 } IllType;
 
@@ -135,7 +136,7 @@ typedef struct IllArch {
 
 typedef struct IllPlan {
     const char *model_path;    /* checkpoint folder, or a .safetensors file */
-    IllType     weight_type;   /* ILL_TYPE_KEEP or ILL_TYPE_Q8              */
+    IllType     weight_type;   /* ILL_TYPE_KEEP, ILL_TYPE_Q8 or ILL_TYPE_Q4 */
     const char *backend_name;  /* NULL selects the default backend          */
     int32_t     thread_count;  /* 0 asks the platform for a sensible count  */
     int32_t     batch_span;    /* prefill chunk in tokens, 0 picks 256      */
@@ -171,9 +172,26 @@ int32_t   ill_state_fill(const IllState *state);   /* cached token count    */
 int32_t   ill_state_span(const IllState *state);   /* cache capacity        */
 size_t    ill_state_bytes(const IllState *state);
 
-/* Rewinds the sequence to `fill` tokens.  Only the key/value cache can be
- * rewound exactly; the stride cache is recurrent, so a rewind past the last
- * `conv_width - 1` tokens is reported as ILL_STATE. */
+/* Remembers where the sequence is, so it can be returned to.  One mark is
+ * kept; marking again replaces it.  The key/value cache needs nothing saved --
+ * it is appended to and the rows past `fill` are simply overwritten -- so what
+ * a mark costs is a copy of the convolution window, which is
+ * `conv_count * model_dim * (conv_width - 1)` floats and is taken once. */
+IllResult ill_state_mark(IllState *state);
+
+/* Returns the sequence to the mark.  ILL_STATE when nothing is marked.  After
+ * it, the state is what it was when `ill_state_mark` was called, and tokens
+ * applied in between are gone as though they had not been. */
+IllResult ill_state_back(IllState *state);
+
+/* The fill the mark was taken at, or -1 when nothing is marked. */
+int32_t   ill_state_mark_at(const IllState *state);
+
+/* Rewinds the sequence to `fill` tokens.  On a model with convolution layers
+ * the stride cache is recurrent, so only two points can be reached: zero, and
+ * a fill that a mark was taken at.  Anything else is reported as ILL_STATE,
+ * because the window it would need cannot be reconstructed from what is kept.
+ * A model without convolution layers can be cropped anywhere. */
 IllResult ill_state_crop(IllState *state, int32_t fill);
 
 /* -- forward pass --------------------------------------------------------- */
@@ -237,6 +255,22 @@ void      ill_sampler_free(IllSampler *sampler);
 void      ill_sampler_wipe(IllSampler *sampler);
 void      ill_sampler_note(IllSampler *sampler, int32_t token);
 int32_t   ill_sampler_pick(IllSampler *sampler, float *logits);
+
+/* Proposes a continuation by finding where the tail of `seen` last appeared
+ * earlier in it, and copying what followed.  Writes at most `want` ids into
+ * `out` and returns how many; zero when nothing repeats.
+ *
+ * This is the draft half of speculative decoding without a draft model: a
+ * decode step reads every weight to produce one token, so several candidate
+ * tokens verified in one pass cost one weight read rather than several, and a
+ * candidate the model would have chosen anyway is a token that came free.
+ * Runs of `reach` tokens are tried first and then shorter ones down to two,
+ * because a long run's continuation is the one worth believing.
+ *
+ * It proposes; it does not decide.  Whatever a caller does with the result,
+ * the tokens it emits should be the ones the model's own rows chose. */
+int32_t ill_draft_scan(const int32_t *seen, int32_t count, int32_t reach,
+                       int32_t *out, int32_t want);
 
 /* -- compute backend ------------------------------------------------------
  *
@@ -795,6 +829,7 @@ const char *ill_type_text(IllType type)
         case ILL_TYPE_F16:  return "f16";
         case ILL_TYPE_BF16: return "bf16";
         case ILL_TYPE_Q8:   return "q8";
+        case ILL_TYPE_Q4:   return "q4";
         default:            return "?";
     }
 }
@@ -806,6 +841,7 @@ size_t ill_type_size(IllType type, size_t count)
         case ILL_TYPE_F16:
         case ILL_TYPE_BF16: return count * 2;
         case ILL_TYPE_Q8:   return count;   /* scales are held separately */
+        case ILL_TYPE_Q4:   return (count + 1) / 2;
         default:            return 0;
     }
 }
@@ -1080,6 +1116,104 @@ static void ill_q8_pack(const float *src, int32_t count, int8_t *quant, float *s
 }
 
 
+/* -- q4 --------------------------------------------------------------------
+ *
+ * The same 32 value block as q8 with the values at half the width, two to a
+ * byte: sixteen bytes and one f32 scale where q8 spends thirty-two and one.
+ * That is 20 bytes a block against 36, so a checkpoint reads 0.56 of what it
+ * read at q8, and decode is bytes over bandwidth.
+ *
+ * All sixteen levels are used by placing the block's largest value exactly on
+ * -8.  The two obvious alternatives each give something up: dividing the
+ * magnitude by 8 and clipping hands the peak back at seven eighths of itself,
+ * and dividing by 7 keeps the peak but widens every step by a seventh, so
+ * every other value in the block is quantised more coarsely for nothing.  The
+ * scale therefore carries a sign, which costs nothing -- it is a float
+ * multiply at the end of a row.
+ *
+ * Within a block the low nibbles of the sixteen bytes hold values 0..15 and
+ * the high nibbles hold 16..31, so lifting a block is sixteen reads rather
+ * than a stride of two through it.
+ * ------------------------------------------------------------------------*/
+
+#define ILL_Q4_BYTES 16   /* packed bytes per block */
+
+/* Quantises one row of f32 into packed nibbles plus per-block scales. */
+static void ill_q4_pack(const float *src, int32_t count, uint8_t *quant, float *scale)
+{
+    int32_t base;
+    for (base = 0; base < count; base += ILL_Q8_BLOCK) {
+        int32_t      span = ILL_MIN(ILL_Q8_BLOCK, count - base);
+        const float *cell = src + base;
+        uint8_t     *dest = quant + (size_t)(base / ILL_Q8_BLOCK) * ILL_Q4_BYTES;
+        float        peak = 0.0f, far = 0.0f, step, back;
+        int32_t      slot;
+        /* The extreme value with its sign, so it lands on -8 exactly. */
+        for (slot = 0; slot < span; ++slot) {
+            float mag = cell[slot] < 0.0f ? -cell[slot] : cell[slot];
+            if (mag > peak) { peak = mag; far = cell[slot]; }
+        }
+        step = far / -8.0f;
+        back = step != 0.0f ? 1.0f / step : 0.0f;
+        scale[base / ILL_Q8_BLOCK] = step;
+        for (slot = 0; slot < ILL_Q8_BLOCK; ++slot) {
+            int32_t cast = 8;                     /* the code for zero */
+            if (slot < span) {
+                float tick = cell[slot] * back;
+                float snap = tick + (tick < 0.0f ? -0.5f : 0.5f);
+                cast = (int32_t)snap + 8;
+                cast = cast > 15 ? 15 : cast;
+                cast = cast <  0 ?  0 : cast;
+            }
+            if (slot < ILL_Q4_BYTES) dest[slot] = (uint8_t)cast;
+            else dest[slot - ILL_Q4_BYTES] |= (uint8_t)(cast << 4);
+        }
+    }
+}
+
+/* Expands one packed block into 32 signed bytes, which is what the q8 dot
+ * products already know how to read.
+ *
+ * This is the form that writes to memory, and it is used where the caller
+ * wants bytes -- reading a row back, and the ragged block at the end of one.
+ * The dot product does not use it: on any machine with vectors the hot path is
+ * `ill_q4_open`, which lifts into a register and never stores.  That
+ * distinction is not a nicety.  Written as sixteen scalar iterations this cost
+ * about thirty times the dot product it fed and q4 decoded seven times slower
+ * than q8 while reading half the bytes; vectorised but still going through a
+ * buffer it was 1.8x slower; only lifting into the register the dot reads did
+ * the format start to pay.  The five instructions are the same either way:
+ * mask the low nibbles, shift and mask the high ones, put the two halves side
+ * by side, and subtract the bias that makes 0..15 into -8..7. */
+#if defined(ILL_ARCH_X86) && (defined(__AVX2__) || defined(__AVX512F__)) && !defined(ILL_NO_SIMD)
+static inline void ill_q4_lift(const uint8_t *packed, int8_t *out)
+{
+    __m128i raw  = _mm_loadu_si128((const __m128i *)packed);
+    __m128i lo   = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+    __m128i hi   = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+    __m256i both = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+    _mm256_storeu_si256((__m256i *)out, _mm256_sub_epi8(both, _mm256_set1_epi8(8)));
+}
+#elif defined(ILL_ARCH_ARM) && defined(__ARM_NEON) && !defined(ILL_NO_SIMD)
+static inline void ill_q4_lift(const uint8_t *packed, int8_t *out)
+{
+    uint8x16_t raw = vld1q_u8(packed);
+    uint8x16_t lo  = vandq_u8(raw, vdupq_n_u8(0x0Fu));
+    uint8x16_t hi  = vshrq_n_u8(raw, 4);
+    vst1q_s8(out, vsubq_s8(vreinterpretq_s8_u8(lo), vdupq_n_s8(8)));
+    vst1q_s8(out + ILL_Q4_BYTES, vsubq_s8(vreinterpretq_s8_u8(hi), vdupq_n_s8(8)));
+}
+#else
+static inline void ill_q4_lift(const uint8_t *packed, int8_t *out)
+{
+    int32_t k;
+    for (k = 0; k < ILL_Q4_BYTES; ++k) {
+        out[k]                = (int8_t)((int32_t)(packed[k] & 0x0Fu) - 8);
+        out[k + ILL_Q4_BYTES] = (int8_t)((int32_t)(packed[k] >> 4) - 8);
+    }
+}
+#endif
+
 /* -- q8 dot ----------------------------------------------------------------
  *
  * One block is 32 signed bytes with an f32 scale on each side.  Integer
@@ -1165,6 +1299,109 @@ static inline IllQAcc ill_q8_step(IllQAcc acc, const int8_t *w, const int8_t *a,
     return acc + (float)tot * step;
 }
 #endif
+
+/* -- q8 dot, two blocks at a time ------------------------------------------
+ *
+ * Two blocks are 64 bytes, which is one 512 bit register, and `vpdpbusd`
+ * folds four byte products into each of its sixteen int32 lanes against
+ * `vpmaddwd`'s two.  That halves the work of the multiply and, more to the
+ * point on a machine that is issue bound rather than memory bound here, it
+ * halves the widening that feeds it: the byte-to-int16 conversions disappear
+ * entirely.  Lanes 0..7 then hold the low block's products and lanes 8..15
+ * the high block's, so the two scales go in as one vector with eight lanes of
+ * each.
+ *
+ * `vpdpbusd` reads its left operand as unsigned, so the weights go in as
+ * magnitudes and their sign moves onto the activations.  A weight of -128
+ * still works -- its magnitude is 128, which is what an unsigned byte is for
+ * -- and the activation side cannot overflow because `ill_q8_pack` clamps
+ * both sides to -127..127.
+ *
+ * Every other instruction set folds the pair back into two single-block
+ * steps, in that order, so nothing outside a VNNI build moves.
+ * ------------------------------------------------------------------------*/
+
+#if defined(ILL_ARCH_X86) && defined(__AVX512VNNI__) && defined(__AVX512BW__) && \
+    defined(__AVX512F__) && !defined(ILL_NO_SIMD)
+#define ILL_Q8_PAIR 1
+#define ILL_Q4_WIDE 1
+/* The dot over two blocks whose sixty-four weights are already in a register.
+ * q8 loads them; q4 unpacks them, and unpacking straight into a register is
+ * the difference between the format paying and not -- lifted through a
+ * sixty-four byte buffer instead, the store and the reload cost more than the
+ * halved weight read saves. */
+static inline IllQAcc ill_q8_pair_wide(IllQAcc acc, __m512i wv, const int8_t *a,
+                                       float lo, float hi)
+{
+    __m512i av  = _mm512_loadu_si512((const void *)a);
+    __mmask64 neg = _mm512_movepi8_mask(wv);               /* where w is negative */
+    __m512i mag = _mm512_abs_epi8(wv);                     /* |w|, read unsigned  */
+    __m512i sgn = _mm512_mask_sub_epi8(av, neg, _mm512_setzero_si512(), av);
+    __m512i tot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), mag, sgn);
+    __m512  sv  = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(lo)),
+                                     _mm256_set1_ps(hi), 1);
+    return _mm512_fmadd_ps(_mm512_cvtepi32_ps(tot), sv, acc);
+}
+
+static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
+                                  float lo, float hi)
+{
+    return ill_q8_pair_wide(acc, _mm512_loadu_si512((const void *)w), a, lo, hi);
+}
+#endif
+
+#if !defined(ILL_Q8_PAIR)
+static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
+                                  float lo, float hi)
+{
+    acc = ill_q8_step(acc, w, a, lo);
+    return ill_q8_step(acc, w + ILL_Q8_BLOCK, a + ILL_Q8_BLOCK, hi);
+}
+#endif
+
+#if defined(ILL_Q4_WIDE)
+typedef __m512i IllQNib;
+
+/* Two packed blocks -- thirty-two bytes -- lifted into sixty-four signed
+ * weights without touching memory.  The low nibbles of a block hold its first
+ * sixteen values and the high nibbles its last sixteen, so the two halves of
+ * each block have to be interleaved back at 128 bit granularity, which is what
+ * the qword permute does. */
+static inline IllQNib ill_q4_open(const uint8_t *packed)
+{
+    __m256i raw = _mm256_loadu_si256((const __m256i *)packed);
+    __m256i lo  = _mm256_and_si256(raw, _mm256_set1_epi8(0x0F));
+    __m256i hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), _mm256_set1_epi8(0x0F));
+    __m512i idx = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+    __m512i nib = _mm512_permutex2var_epi64(_mm512_castsi256_si512(lo), idx,
+                                            _mm512_castsi256_si512(hi));
+    return _mm512_sub_epi8(nib, _mm512_set1_epi8(8));
+}
+
+static inline IllQAcc ill_q4_dot(IllQAcc acc, IllQNib w, const int8_t *a,
+                                 float lo, float hi)
+{
+    return ill_q8_pair_wide(acc, w, a, lo, hi);
+}
+#else
+/* Everywhere else the lift goes through a buffer and the q8 pair reads it. */
+typedef struct IllQNib { int8_t cell[2 * ILL_Q8_BLOCK]; } IllQNib;
+
+static inline IllQNib ill_q4_open(const uint8_t *packed)
+{
+    IllQNib nib;
+    ill_q4_lift(packed, nib.cell);
+    ill_q4_lift(packed + ILL_Q4_BYTES, nib.cell + ILL_Q8_BLOCK);
+    return nib;
+}
+
+static inline IllQAcc ill_q4_dot(IllQAcc acc, IllQNib w, const int8_t *a,
+                                 float lo, float hi)
+{
+    return ill_q8_pair(acc, w.cell, a, lo, hi);
+}
+#endif
+
 
 /* ============================================================================
  * part 6 -- json reader
@@ -1807,7 +2044,7 @@ typedef struct IllPlane {
  * registers.
  * ------------------------------------------------------------------------*/
 
-#define ILL_TILE_MAX 4
+#define ILL_TILE_MAX 8
 
 #define ILL_DENSE_BODY(N, LOADW, CTYPE, CASTW)                                        \
     do {                                                                              \
@@ -1855,7 +2092,11 @@ static void ill_dense_real(const IllPlane *plane, const float *x, size_t xstep,
         case 1:  ILL_DENSE_TYPED(1); break;
         case 2:  ILL_DENSE_TYPED(2); break;
         case 3:  ILL_DENSE_TYPED(3); break;
-        default: ILL_DENSE_TYPED(4); break;
+        case 4:  ILL_DENSE_TYPED(4); break;
+        case 5:  ILL_DENSE_TYPED(5); break;
+        case 6:  ILL_DENSE_TYPED(6); break;
+        case 7:  ILL_DENSE_TYPED(7); break;
+        default: ILL_DENSE_TYPED(8); break;
     }
 }
 
@@ -1868,7 +2109,15 @@ static void ill_dense_real(const IllPlane *plane, const float *x, size_t xstep,
             IllQAcc acc[N];                                                           \
             int32_t t, b;                                                             \
             for (t = 0; t < N; ++t) acc[t] = ill_q8_zero();                           \
-            for (b = 0; b + 1 <= full; ++b) {                                         \
+            for (b = 0; b + 2 <= full; b += 2) {                                      \
+                const int8_t *wb = w + (size_t)b * ILL_Q8_BLOCK;                      \
+                for (t = 0; t < N; ++t)                                               \
+                    acc[t] = ill_q8_pair(acc[t],                                      \
+                                wb, xq + (size_t)t * qstep + (size_t)b * ILL_Q8_BLOCK, \
+                                ws[b] * xs[(size_t)t * sstep + b],                    \
+                                ws[b + 1] * xs[(size_t)t * sstep + b + 1]);           \
+            }                                                                         \
+            for (; b < full; ++b) {                                                   \
                 const int8_t *wb = w + (size_t)b * ILL_Q8_BLOCK;                      \
                 for (t = 0; t < N; ++t)                                               \
                     acc[t] = ill_q8_step(acc[t],                                      \
@@ -1902,7 +2151,81 @@ static void ill_dense_byte(const IllPlane *plane, const int8_t *xq, size_t qstep
         case 1:  ILL_DENSE_Q8_BODY(1); break;
         case 2:  ILL_DENSE_Q8_BODY(2); break;
         case 3:  ILL_DENSE_Q8_BODY(3); break;
-        default: ILL_DENSE_Q8_BODY(4); break;
+        case 4:  ILL_DENSE_Q8_BODY(4); break;
+        case 5:  ILL_DENSE_Q8_BODY(5); break;
+        case 6:  ILL_DENSE_Q8_BODY(6); break;
+        case 7:  ILL_DENSE_Q8_BODY(7); break;
+        default: ILL_DENSE_Q8_BODY(8); break;
+    }
+}
+
+/* -- dense with q4 weights -------------------------------------------------
+ *
+ * The activations are still q8: the saving is in the weights, which are what a
+ * decode step reads.  A block pair is lifted once into signed bytes and then
+ * fused against every activation row in the tile, so the unpacking is paid
+ * once per weight rather than once per weight per token.
+ * ------------------------------------------------------------------------*/
+
+#define ILL_DENSE_Q4_BODY(N)                                                          \
+    do {                                                                              \
+        int32_t r;                                                                    \
+        for (r = r0; r < r1; ++r) {                                                   \
+            const uint8_t *w  = (const uint8_t *)plane->cells +                       \
+                                (size_t)r * (size_t)blocks * ILL_Q4_BYTES;            \
+            const float   *ws = plane->steps + (size_t)r * (size_t)blocks;            \
+            int8_t  lift[2 * ILL_Q8_BLOCK];                                           \
+            IllQAcc acc[N];                                                           \
+            int32_t t, b;                                                             \
+            for (t = 0; t < N; ++t) acc[t] = ill_q8_zero();                           \
+            for (b = 0; b + 2 <= full; b += 2) {                                      \
+                IllQNib wide = ill_q4_open(w + (size_t)b * ILL_Q4_BYTES);             \
+                for (t = 0; t < N; ++t)                                               \
+                    acc[t] = ill_q4_dot(acc[t], wide,                                 \
+                                xq + (size_t)t * qstep + (size_t)b * ILL_Q8_BLOCK,    \
+                                ws[b] * xs[(size_t)t * sstep + b],                    \
+                                ws[b + 1] * xs[(size_t)t * sstep + b + 1]);           \
+            }                                                                         \
+            for (; b < full; ++b) {                                                   \
+                ill_q4_lift(w + (size_t)b * ILL_Q4_BYTES, lift);                      \
+                for (t = 0; t < N; ++t)                                               \
+                    acc[t] = ill_q8_step(acc[t],                                      \
+                                lift, xq + (size_t)t * qstep + (size_t)b * ILL_Q8_BLOCK, \
+                                ws[b] * xs[(size_t)t * sstep + b]);                   \
+            }                                                                         \
+            for (t = 0; t < N; ++t) {                                                 \
+                float sum = ill_q8_fold(acc[t]);                                      \
+                for (b = full; b < blocks; ++b) {                                     \
+                    int32_t base = b * ILL_Q8_BLOCK;                                  \
+                    int32_t span = ILL_MIN(ILL_Q8_BLOCK, cols - base);                \
+                    int32_t tot = 0, slot;                                            \
+                    ill_q4_lift(w + (size_t)b * ILL_Q4_BYTES, lift);                  \
+                    for (slot = 0; slot < span; ++slot)                               \
+                        tot += (int32_t)lift[slot] *                                  \
+                               (int32_t)xq[(size_t)t * qstep + base + slot];          \
+                    sum += (float)tot * ws[b] * xs[(size_t)t * sstep + b];            \
+                }                                                                     \
+                y[(size_t)t * ystep + r] = sum;                                       \
+            }                                                                         \
+        }                                                                             \
+    } while (0)
+
+static void ill_dense_nib(const IllPlane *plane, const int8_t *xq, size_t qstep,
+                          const float *xs, size_t sstep, int32_t tiles,
+                          int32_t r0, int32_t r1, float *y, size_t ystep)
+{
+    const int32_t cols   = plane->cols;
+    const int32_t blocks = plane->blocks;
+    const int32_t full   = cols / ILL_Q8_BLOCK;   /* whole blocks only */
+    switch (tiles) {
+        case 1:  ILL_DENSE_Q4_BODY(1); break;
+        case 2:  ILL_DENSE_Q4_BODY(2); break;
+        case 3:  ILL_DENSE_Q4_BODY(3); break;
+        case 4:  ILL_DENSE_Q4_BODY(4); break;
+        case 5:  ILL_DENSE_Q4_BODY(5); break;
+        case 6:  ILL_DENSE_Q4_BODY(6); break;
+        case 7:  ILL_DENSE_Q4_BODY(7); break;
+        default: ILL_DENSE_Q4_BODY(8); break;
     }
 }
 
@@ -1945,6 +2268,22 @@ static void ill_soft_max(float *cells, int32_t width)
     for (j = 0; j < width; ++j) { cells[j] = expf(cells[j] - peak); mass += cells[j]; }
     back = mass > 0.0f ? 1.0f / mass : 0.0f;
     for (j = 0; j < width; ++j) cells[j] *= back;
+}
+
+/* log(sum(exp(row))), the normaliser a row's log probabilities are measured
+ * against.  Taken relative to the row's peak, which is the only way to write
+ * it that does not overflow on logits of this size, and summed in double
+ * because a score adds one of these per token over a whole text and f32 loses
+ * the tail of that sum.  `ill_soft_max` answers a different question -- it
+ * wants the probabilities themselves and may destroy the row to get them. */
+static double ill_row_logsum(const float *row, int32_t width)
+{
+    double  mass = 0.0;
+    float   peak = -FLT_MAX;
+    int32_t j;
+    for (j = 0; j < width; ++j) if (row[j] > peak) peak = row[j];
+    for (j = 0; j < width; ++j) mass += exp((double)(row[j] - peak));
+    return (double)peak + log(mass);
 }
 
 /* dst += weight * src, the attention value mix and the conv tap. */
@@ -1993,6 +2332,20 @@ static void ill_plane_row(const IllPlane *plane, int32_t row, float *dst)
             const int8_t *w  = (const int8_t *)plane->cells + (size_t)row * cols;
             const float  *ws = plane->steps + (size_t)row * plane->blocks;
             for (j = 0; j < cols; ++j) dst[j] = (float)w[j] * ws[j / ILL_Q8_BLOCK];
+            break;
+        }
+        case ILL_TYPE_Q4: {
+            const uint8_t *w = (const uint8_t *)plane->cells +
+                               (size_t)row * (size_t)plane->blocks * ILL_Q4_BYTES;
+            const float   *ws = plane->steps + (size_t)row * plane->blocks;
+            int8_t lift[ILL_Q8_BLOCK];
+            int32_t b;
+            for (b = 0; b < plane->blocks; ++b) {
+                int32_t base = b * ILL_Q8_BLOCK;
+                int32_t span = ILL_MIN(ILL_Q8_BLOCK, cols - base);
+                ill_q4_lift(w + (size_t)b * ILL_Q4_BYTES, lift);
+                for (j = 0; j < span; ++j) dst[base + j] = (float)lift[j] * ws[b];
+            }
             break;
         }
         default: memset(dst, 0, (size_t)cols * sizeof(float)); break;
@@ -2116,6 +2469,11 @@ static void ill_cpu_dense_chore(void *args, int32_t chunk, int32_t chunks, int32
                            job->steps + (size_t)tile * pl->blocks, (size_t)pl->blocks,
                            span, r0, r1, job->dst + (size_t)tile * pl->rows,
                            (size_t)pl->rows);
+        else if (pl->type == ILL_TYPE_Q4)
+            ill_dense_nib(pl, job->quant + (size_t)tile * pl->cols, (size_t)pl->cols,
+                          job->steps + (size_t)tile * pl->blocks, (size_t)pl->blocks,
+                          span, r0, r1, job->dst + (size_t)tile * pl->rows,
+                          (size_t)pl->rows);
         else
             ill_dense_real(pl, job->src + (size_t)tile * pl->cols, (size_t)pl->cols,
                            span, r0, r1, job->dst + (size_t)tile * pl->rows,
@@ -2142,7 +2500,7 @@ static void ill_cpu_dense(IllBackend *self, const IllPlane *plane, const float *
     job.quant  = NULL;
     job.steps  = NULL;
 
-    if (plane->type == ILL_TYPE_Q8) {
+    if (plane->type == ILL_TYPE_Q8 || plane->type == ILL_TYPE_Q4) {
         int32_t row;
         for (row = 0; row < tokens; ++row)
             ill_q8_pack(src + (size_t)row * plane->cols, plane->cols,
@@ -2475,9 +2833,10 @@ static const float *ill_model_vec(IllModel *model, const IllSlab *slab, int32_t 
 
 typedef struct IllPackArgs {
     const IllPlane *from;
-    int8_t         *quant;
+    void           *quant;
     float          *steps;
     int32_t         blocks;
+    IllType         into;
 } IllPackArgs;
 
 static void ill_model_pack_chore(void *args, int32_t chunk, int32_t chunks, int32_t worker)
@@ -2493,29 +2852,38 @@ static void ill_model_pack_chore(void *args, int32_t chunk, int32_t chunks, int3
     if (!row) return;
     for (r = r0; r < r1; ++r) {
         ill_plane_row(from, r, row);
-        ill_q8_pack(row, from->cols,
-                    job->quant + (size_t)r * from->cols,
-                    job->steps + (size_t)r * job->blocks);
+        if (job->into == ILL_TYPE_Q4)
+            ill_q4_pack(row, from->cols,
+                        (uint8_t *)job->quant + (size_t)r * (size_t)job->blocks * ILL_Q4_BYTES,
+                        job->steps + (size_t)r * job->blocks);
+        else
+            ill_q8_pack(row, from->cols,
+                        (int8_t *)job->quant + (size_t)r * from->cols,
+                        job->steps + (size_t)r * job->blocks);
     }
     ill_block_free(row);
 }
 
-/* Rewrites a plane into q8 in freshly owned memory. */
-static IllResult ill_model_pack(IllModel *model, IllPlane *plane)
+/* Rewrites a plane into a block format in freshly owned memory. */
+static IllResult ill_model_pack(IllModel *model, IllPlane *plane, IllType into)
 {
     IllPlane    from = *plane;
     IllPackArgs job;
     IllCpu     *cpu  = (IllCpu *)model->backend->inner;
     int32_t     blocks = ill_q8_blocks(from.cols);
-    int8_t     *quant;
+    size_t      width = into == ILL_TYPE_Q4
+                      ? (size_t)blocks * ILL_Q4_BYTES     /* padded to whole blocks */
+                      : (size_t)from.cols;
+    void       *quant;
     float      *steps;
 
-    quant = (int8_t *)ill_block_make((size_t)from.rows * from.cols);
+    quant = ill_block_make((size_t)from.rows * width);
     steps = (float *)ill_block_make((size_t)from.rows * blocks * sizeof(float));
     if (!quant || !steps) { ill_block_free(quant); ill_block_free(steps); return ILL_ALLOC; }
     if (!ill_model_own(model, quant) || !ill_model_own(model, steps)) return ILL_ALLOC;
 
-    job.from = &from; job.quant = quant; job.steps = steps; job.blocks = blocks;
+    job.from = &from; job.quant = quant; job.steps = steps;
+    job.blocks = blocks; job.into = into;
     if (model->backend == &ill_backend_cpu && cpu)
         ill_pool_fork(cpu->pool, ill_model_pack_chore, &job, cpu->lanes);
     else
@@ -2523,9 +2891,10 @@ static IllResult ill_model_pack(IllModel *model, IllPlane *plane)
 
     plane->cells  = quant;
     plane->steps  = steps;
-    plane->type   = ILL_TYPE_Q8;
+    plane->type   = into;
     plane->blocks = blocks;
-    model->bytes += (size_t)from.rows * from.cols + (size_t)from.rows * blocks * sizeof(float);
+    model->bytes += (size_t)from.rows * width +
+                    (size_t)from.rows * blocks * sizeof(float);
     return ILL_OK;
 }
 
@@ -2547,9 +2916,9 @@ static IllResult ill_model_plane(IllModel *model, IllPlane *plane, const IllSlab
     plane->cols   = (int32_t)slab->dims[1];
     plane->blocks = 0;
     model->bytes += slab->bytes;
-    if (model->weight_type == ILL_TYPE_Q8) {
+    if (model->weight_type == ILL_TYPE_Q8 || model->weight_type == ILL_TYPE_Q4) {
         model->bytes -= slab->bytes;
-        return ill_model_pack(model, plane);
+        return ill_model_pack(model, plane, model->weight_type);
     }
     return ILL_OK;
 }
@@ -2679,7 +3048,9 @@ IllResult ill_model_load(IllModel **out, const IllPlan *plan)
 
     model = (IllModel *)ill_block_zero(sizeof(IllModel));
     if (!model) return ILL_ALLOC;
-    model->weight_type = plan->weight_type == ILL_TYPE_Q8 ? ILL_TYPE_Q8 : ILL_TYPE_KEEP;
+    model->weight_type = (plan->weight_type == ILL_TYPE_Q8 ||
+                          plan->weight_type == ILL_TYPE_Q4)
+                       ? plan->weight_type : ILL_TYPE_KEEP;
     model->batch_span  = plan->batch_span > 0 ? plan->batch_span : 256;
     arch = &model->arch;
 
@@ -2845,7 +3216,8 @@ IllResult ill_model_load(IllModel **out, const IllPlan *plan)
              arch->inner_dim, arch->head_count, arch->group_count, arch->head_dim,
              arch->vocab_size);
     ill_note(2, "weights: %s, %.2f GiB resident, backend %s/%s, %d threads",
-             model->weight_type == ILL_TYPE_Q8 ? "q8" : "as stored",
+             model->weight_type == ILL_TYPE_KEEP ? "as stored"
+                                                 : ill_type_text(model->weight_type),
              (double)model->bytes / 1073741824.0, model->backend->name, ILL_SIMD_NAME,
              model->backend->width(model->backend));
 
@@ -2900,6 +3272,8 @@ struct IllState {
     float    *keys;        /* attn_count * groups * span * head_dim          */
     float    *vals;
     float    *hist;        /* conv_count * model_dim * (conv_width - 1)      */
+    float    *echo;        /* the window as it stood at the mark, or NULL    */
+    int32_t   echo_fill;   /* fill at the mark, or -1 when nothing is marked */
 
     float    *lane;        /* residual stream, batch * model_dim             */
     float    *rest;        /* normalised stream                              */
@@ -2963,6 +3337,7 @@ IllResult ill_state_make(IllState **out, IllModel *model, int32_t span)
     if (!state) return ILL_ALLOC;
     state->model = model;
     state->span  = span;
+    state->echo_fill = -1;          /* zeroed memory would read as a mark at 0 */
     state->batch = ILL_MIN(model->batch_span, span);
     if (state->batch < 1) state->batch = 1;
 
@@ -2996,7 +3371,7 @@ IllResult ill_state_make(IllState **out, IllModel *model, int32_t span)
     ILL_CLAIM(gate, (size_t)state->batch * arch->inner_dim);
     ILL_CLAIM(rise, (size_t)state->batch * arch->inner_dim);
 
-    if (model->weight_type == ILL_TYPE_Q8) {
+    if (model->weight_type == ILL_TYPE_Q8 || model->weight_type == ILL_TYPE_Q4) {
         state->pad.rows  = state->batch;
         state->pad.cols  = wide;
         state->pad.quant = (int8_t *)ill_state_own(state, (size_t)state->batch * wide);
@@ -3034,6 +3409,7 @@ void ill_state_reset(IllState *state)
     if (!state) return;
     arch = &state->model->arch;
     state->fill = 0;
+    state->echo_fill = -1;          /* the sequence it pointed into is gone */
     if (state->hist)
         memset(state->hist, 0, (size_t)arch->conv_count * arch->model_dim *
                                (size_t)ILL_MAX(arch->conv_width - 1, 1) * sizeof(float));
@@ -3043,14 +3419,62 @@ int32_t ill_state_fill(const IllState *state) { return state ? state->fill : 0; 
 int32_t ill_state_span(const IllState *state) { return state ? state->span : 0; }
 size_t  ill_state_bytes(const IllState *state) { return state ? state->bytes : 0; }
 
+/* How many floats the convolution window occupies.  Zero on a model that has
+ * no convolution layers, where a mark is the fill and nothing else. */
+static size_t ill_state_window(const IllState *state)
+{
+    const IllArch *arch = &state->model->arch;
+    if (arch->conv_count <= 0 || !state->hist) return 0;
+    return (size_t)arch->conv_count * (size_t)arch->model_dim *
+           (size_t)ILL_MAX(arch->conv_width - 1, 1);
+}
+
+IllResult ill_state_mark(IllState *state)
+{
+    size_t cells;
+    if (!state) return ILL_ARGS;
+    cells = ill_state_window(state);
+    /* The saved window is claimed on the first mark rather than at
+     * ill_state_make, so a caller that never marks never pays for it. */
+    if (cells > 0 && !state->echo) {
+        state->echo = (float *)ill_state_own(state, cells * sizeof(float));
+        if (!state->echo) return ILL_ALLOC;
+    }
+    if (cells > 0) memcpy(state->echo, state->hist, cells * sizeof(float));
+    state->echo_fill = state->fill;
+    return ILL_OK;
+}
+
+IllResult ill_state_back(IllState *state)
+{
+    size_t cells;
+    if (!state) return ILL_ARGS;
+    if (state->echo_fill < 0) return ILL_STATE;
+    cells = ill_state_window(state);
+    if (cells > 0) memcpy(state->hist, state->echo, cells * sizeof(float));
+    /* Nothing is done to the key/value cache.  Rows past `fill` are never
+     * read -- the attention scan is bounded by the fill at the time -- and the
+     * next tokens to arrive write over them. */
+    state->fill = state->echo_fill;
+    return ILL_OK;
+}
+
+int32_t ill_state_mark_at(const IllState *state)
+{
+    return state ? state->echo_fill : -1;
+}
+
 IllResult ill_state_crop(IllState *state, int32_t fill)
 {
     if (!state || fill < 0 || fill > state->fill) return ILL_ARGS;
     if (fill == state->fill) return ILL_OK;
     if (fill == 0) { ill_state_reset(state); return ILL_OK; }
     if (state->model->arch.conv_count > 0) {
-        /* The convolution window is recurrent: dropping tokens from the tail
-         * cannot be undone without replaying the sequence. */
+        /* The convolution window is recurrent, so dropping tokens from the
+         * tail cannot be undone from what the state holds -- unless this is
+         * the point a mark was taken at, where the window was saved and the
+         * rewind is exact. */
+        if (fill == state->echo_fill && state->echo) return ill_state_back(state);
         return ILL_STATE;
     }
     state->fill = fill;
@@ -3374,6 +3798,32 @@ static int32_t ill_utf8_read(const char *text, int32_t len, int32_t pos, uint32_
     }
     *rune = p[0];
     return 1;
+}
+
+/* How many bytes at the end of `text` are the start of a sequence that has not
+ * finished yet.  Zero when the buffer ends cleanly, which includes the case
+ * where it ends in something that is not valid UTF-8 at all -- a caller
+ * holding bytes back wants to release rubbish rather than wait forever for a
+ * continuation that is never coming.
+ *
+ * This exists for streaming output.  A token's bytes can stop in the middle of
+ * a character, and a terminal shown those bytes draws a replacement character
+ * that the next token then corrects, so every multi-byte language flickers. */
+static int32_t ill_utf8_hold(const char *text, int32_t len)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    int32_t at = len - 1, need;
+    if (len <= 0) return 0;
+    /* Walk back over continuation bytes.  A sequence is at most four bytes, so
+     * three continuations is as far as a lead byte can be. */
+    while (at >= 0 && (p[at] & 0xC0) == 0x80 && len - at <= 3) --at;
+    if (at < 0) return 0;                    /* continuations all the way down */
+    if (p[at] < 0x80) return 0;              /* plain ascii, nothing pending   */
+    if      ((p[at] & 0xE0) == 0xC0) need = 2;
+    else if ((p[at] & 0xF0) == 0xE0) need = 3;
+    else if ((p[at] & 0xF8) == 0xF0) need = 4;
+    else return 0;                           /* not a lead byte at all        */
+    return len - at < need ? len - at : 0;
 }
 
 static int32_t ill_utf8_write(uint32_t rune, char *out)
@@ -4474,6 +4924,29 @@ int32_t ill_sampler_pick(IllSampler *sampler, float *logits)
         if (draw <= 0.0f) return sampler->cands[index].token;
     }
     return sampler->cands[keep - 1].token;
+}
+
+/* -- drafting -------------------------------------------------------------- */
+
+int32_t ill_draft_scan(const int32_t *seen, int32_t count, int32_t reach,
+                       int32_t *out, int32_t want)
+{
+    int32_t run, at, took;
+    if (!seen || !out || want <= 0 || count < 3) return 0;
+    if (reach < 2) reach = 2;
+    for (run = reach; run >= 2; --run) {
+        const int32_t *tail = seen + count - run;
+        /* A run needs somewhere earlier to have been, and something to have
+         * followed it there, so a match at the very end proposes nothing. */
+        if (count < run + 2) continue;
+        for (at = count - run - 1; at >= 0; --at) {
+            if (memcmp(seen + at, tail, (size_t)run * sizeof(int32_t)) != 0) continue;
+            for (took = 0; took < want && at + run + took < count; ++took)
+                out[took] = seen[at + run + took];
+            if (took > 0) return took;
+        }
+    }
+    return 0;
 }
 
 /* ============================================================================

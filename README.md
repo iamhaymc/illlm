@@ -18,26 +18,33 @@ It runs Hugging Face checkpoints directly (included in the repository).
 
 ```sh
 python3 util/make.py build                             # a few seconds, no dependencies
-./build/app_main info      --model ckpt/lfm2.5-0.4b
+./build/app_main info      --model ckpt/lfm2.5-2.6b-a
 ./build/app_main generate  --model ckpt/lfm2.5-2.6b-a --prompt "Write a haiku about rivers."
-./build/app_main chat      --model ckpt/lfm2.5-0.4b
+./build/app_main chat      --model ckpt/lfm2.5-2.6b-a
 ```
 
-Add `--quant q8` to halve the memory and roughly double decode speed. 
+Add `--quant q8` to halve the memory and roughly double decode speed, or
+`--quant q4` to halve it again — 1.57 GiB for the 2.6B, and 1.23x q8's decode.
+Read what q4 costs before choosing it: on ordinary prose, nothing a perplexity
+can see; on text the model should find easy, most of its confidence. Add
+`--draft 4` to greedy decoding to verify four context-drafted tokens in each
+pass, which is worth about a quarter on work whose answer quotes its question
+and costs nothing when it does not.
 Add `--threads N` to pick a worker count; the default is the host's core count.
 
 ```sh
-python3 util/make.py test                              # unit tests plus reference comparison
-python3 util/make.py bench --model path/to/lfm2.5-2.6b-a # prefill and decode throughput
+python3 util/make.py test                                 # unit tests plus reference comparison
+python3 util/make.py bench --model ckpt/lfm2.5-2.6b-a     # prefill and decode throughput
+./build/app_main perplexity --model ckpt/lfm2.5-2.6b-a --quant q8 < some.txt
 python3 util/make.py run -- generate --model DIR --prompt "hello"
 ```
 
 `make.py test` needs `torch` and `transformers`, which `python3 util/make.py install`
 provides. The engine itself has no dependencies at all. The published
-checkpoints ship in `ckpt/` — `ckpt/lfm2.5-0.4b` (LFM2.5-350M) and
-`ckpt/lfm2.5-2.6b-a` (LFM2.5-2.6B) — so the checkpoint
+checkpoints ship in `ckpt/` — `ckpt/lfm2.5-2.6b-a` (a 2.6B causal model), beside an
+encoder and a vision-language checkpoint this engine does not run — so the checkpoint
 suite — logits, tokenizer, throughput, and greedy behaviour against the
-reference — runs by default against `ckpt/lfm2.5-0.4b`; `--no-checkpoint` skips it,
+reference — runs by default against `ckpt/lfm2.5-2.6b-a`; `--no-checkpoint` skips it,
 and `--model PATH` points somewhere else.
 
 Compare like with like: the throughput check runs both sides at bf16 and the
@@ -103,30 +110,48 @@ and biased convolution kernels; f32, f16, and bf16 storage; chunked prefill and
 single token decode; and tokenizer agreement over a corpus of awkward strings.
 
 Against float32 checkpoints the engine matches the reference to **2e-7
-relative**, which is float32 rounding. `test/test.c` adds 73 unit checks over the
-internals. Both suites run clean under AddressSanitizer and UndefinedBehaviorSanitizer.
+relative**, which is float32 rounding. `test/test.c` adds 119 unit checks over
+the internals. Both suites run clean under AddressSanitizer and
+UndefinedBehaviorSanitizer.
 
 ### ➖ Comparison
 
+The published `LiquidAI/LFM2.5-2.6B` checkpoint — 30 layers, 8 attention and 22
+convolution, model dim 2048, feed forward 10752, 32 query heads over 8
+key-value heads, vocabulary 128000 — on four x86-64 cores at 2.80 GHz with
+AVX-512 and VNNI, at q8:
+
+|         | weights  | prefill, 256 tok | decode     |
+| ------- | -------- | ---------------- | ---------- |
+| q8      | 2.83 GiB | 32.2 tok/s       | 9.7 tok/s  |
+| q4      | 1.57 GiB | 30.0 tok/s       | 11.9 tok/s |
+
+q8 decode on that host is 32.5 GB/s of weight traffic against a 36.6 GB/s bare
+memory sweep, which is 89% of what the machine can fetch — at q8 decode is the
+memory and there is little left in the kernel. q4 reads fewer bytes and comes
+off that ceiling: 20.0 GB/s, with the unpack and the dot deciding the rate
+instead. Prefill is arithmetic bound throughout, which is why q4 is slower at
+it than q8.
+
 A synthetic 2.9B-parameter checkpoint of LFM2-2.6B proportions — 32 layers,
-model dim 2560, feed forward 8192, 32 query heads over 8 key-value heads,
-vocabulary 65536 — on four x86-64 cores with AVX-512:
+model dim 2560, feed forward 8192, vocabulary 65536 — on an earlier four-core
+AVX-512 host, before the paired dot:
 
 |                      | weights  | prefill    | decode    |
 | -------------------- | -------- | ---------- | --------- |
 | bf16, as stored      | 5.44 GiB | 38.0 tok/s | 5.2 tok/s |
 | q8, repacked at load | 3.06 GiB | 37.1 tok/s | 9.0 tok/s |
 
-Decode scales 2.4 → 4.6 → 8.9 tok/s across one, two, and four threads. Loading
-bf16 costs about a tenth of a second because the weights are memory mapped and
-never copied; repacking to q8 costs about three seconds once.
+Decode scaled 2.4 → 4.6 → 8.9 tok/s across one, two, and four threads there.
+Loading bf16 costs about a tenth of a second because the weights are memory
+mapped and never copied; repacking to q8 costs a few seconds once.
 
 ## ↘️✴️ FINETUNE
 
 The engine has no trainer. A tune happens on the reference side and comes back
 as a checkpoint the engine reads unchanged: `util/tune.py` trains a LoRA adapter
 over the frozen base, folds it into the float weights, and writes
-`build/tune/merged` in the same layout as `ckpt/lfm2.5-0.4b`.
+`build/tune/merged` in the same layout as `ckpt/lfm2.5-2.6b-a`.
 
 What it tunes for is **caveman**, the compression register described by the
 skill at <https://github.com/JuliusBrussee/caveman>: drop articles, filler,
@@ -148,10 +173,10 @@ levels in the corpus, counted with the checkpoint's own tokenizer.
 
 ```sh
 python3 util/tune.py --lint                           # audit the corpus
-python3 util/tune.py --model ckpt/lfm2.5-0.4b --uncensor     # abliterate into build/tune/uncensored
-python3 util/tune.py --model ckpt/lfm2.5-0.4b --train        # LoRA adapter into build/tune
-python3 util/tune.py --model ckpt/lfm2.5-0.4b --merge        # fold it into build/tune/merged
-python3 util/tune.py --model ckpt/lfm2.5-0.4b --check --tuned build/tune/merged
+python3 util/tune.py --model ckpt/lfm2.5-2.6b-a --uncensor     # abliterate into build/tune/uncensored
+python3 util/tune.py --model ckpt/lfm2.5-2.6b-a --train        # LoRA adapter into build/tune
+python3 util/tune.py --model ckpt/lfm2.5-2.6b-a --merge        # fold it into build/tune/merged
+python3 util/tune.py --model ckpt/lfm2.5-2.6b-a --check --tuned build/tune/merged
 ```
 
 `--check` is the number that says whether it worked: it runs the base and the
@@ -165,7 +190,7 @@ only delete cannot introduce a claim the source did not make.
 [heretic](https://github.com/p-e-w/heretic) over the checkpoint — no gradient
 step and no corpus, but a low rank edit subtracting the direction the residual
 stream moves in when the model is about to refuse — and writes the decensored
-weights to `build/tune/uncensored` in the same layout as `ckpt/lfm2.5-0.4b`, so the engine
+weights to `build/tune/uncensored` in the same layout as `ckpt/lfm2.5-2.6b-a`, so the engine
 reads them unchanged. It needs `pip install heretic-llm`, and it needs a card:
 the search scores a hundred generations and a hundred forward passes per trial,
 two hundred trials by default.
@@ -181,7 +206,7 @@ weights 4-bit for a smaller card, and `--uncensor-out` writes somewhere else.
 The steps chain, so the whole thing is one command:
 
 ```sh
-python3 util/tune.py --model ckpt/lfm2.5-0.4b --uncensor --train --merge
+python3 util/tune.py --model ckpt/lfm2.5-2.6b-a --uncensor --train --merge
 ```
 
 The adapter then trains over the decensored weights rather than over the base,

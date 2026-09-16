@@ -1,131 +1,297 @@
 # TODO (Open)
 
-Open development tasks, grouped by what they block. 
-Nothing here is required for the engine to run correctly today.
+Open work, most consequential first. Nothing here is required for the engine to
+run correctly today; everything here either makes it faster, makes it honest
+about what it costs, or lets it read a checkpoint it currently refuses.
 
-## Verification
-
-- Run `util/make.py test --model PATH` against the published `LiquidAI/lfm2.5-2.6b-a`
-  weights. Partly done: `info` and `generate` run against the published
-  checkpoint (2.69B, 30 layers: 8 attention + 22 convolution), prefill and
-  decode both produce coherent text, and the harness compares logits against
-  transformers on that checkpoint. The full harness -- every architectural
-  shape plus the tokenizer corpus -- has not been run against the real weights
-  yet, which is what this item asks for.
-- ~~Confirm the tokenizer flavour of the published checkpoint.~~ LFM2.5 ships
-  byte level BPE (128000 pieces, 124 added tokens, llama3 split), which the
-  engine reads.
-- Confirm the chat template. Prompt shaping detects `<|im_start|>` in the
-  vocabulary rather than evaluating the Jinja template, and `--raw` bypasses it.
-  The checkpoint's chat_template.jinja is present; the detector matched the
-  chatml flavour.
-- ~~Build and run the test suite on Windows with MSVC.~~ Done on x64: compiles
-  with MSVC 19.42 after two fixes in app/core.c -- the `near` local (a Win32
-  macro) renamed, and an atomic shim (Interlocked-based) so the Win32 thread
-  pool engages instead of falling back to single threaded. 73 checks pass.
-  The shim is scoped to x86/x64; see the arm64 item below.
-- Build and run the test suite on arm64. The NEON instantiation of the vector
-  vocabulary has not been compiled on hardware. On MSVC/arm64 specifically the
-  engine still takes the single threaded fallback: the atomic shim's loads are
-  plain volatile reads, which are acquire on x86 but not under `/volatile:iso`
-  on arm64, and `ill_cpu_pause` has no MSVC arm64 arm. Both need real barriers
-  before that target can enable the pool.
-- Add a perplexity command so accuracy loss from `--quant q8` can be reported as
-  a number rather than as a correlation.
-- Run the caveman tune against the published weights. **Blocked**: the pipeline
-  in `util/tune.py` is verified end to end on a synthetic six layer Liquid
-  checkpoint carrying the real tokenizer and chat template -- the loss mask
-  covers the assistant span and nothing before it, the adapter reaches 34 of
-  the 35 linear layers, the merge preserves the checkpoint's own dtype, the
-  anchor term is exactly zero at initialisation and the `--check` pass runs --
-  but no tune has been taken over the 2.6B weights, so there is no number for
-  what the register costs in accuracy. It needs a card, not a change.
-- Run the abliteration against the published weights. **Blocked**: the drive in
-  `util/tune.py` is verified end to end on a synthetic four layer Liquid
-  checkpoint carrying the real tokenizer and chat template over the real 128000
-  entry vocabulary -- heretic reaches eight modules over the four blocks, the
-  settings arrive as heretic parses them, a two trial search exports the trial
-  the cap allows, the saved folder carries the template and the generation
-  defaults and the engine reads it, an interrupted or finished study resumes
-  from `build/tune/uncensor-study` rather than starting again, and
-  `--uncensor --train --merge` in one command trains the adapter over the
-  decensored weights -- but no abliteration has been taken over the 2.6B
-  weights, because the search costs a hundred generations and a hundred forward
-  passes per trial over two hundred trials, which is a card's work and not a
-  processor's. What is missing is the pair of numbers that says what it bought
-  and what it cost: refusals on the held out harmful prompts beside the base's,
-  and a `--check` afterwards to say whether the register and the answers
-  survived the edit. It needs a card, not a change.
-- Grow `data/tune.jsonl` past its 202 hand written rows with `--make-data`
-  against a published reasoning corpus. The press is deletion only and takes
-  about 29% off the prose it is given, which is the floor rather than the
-  ceiling: a hand written caveman answer restructures and reaches 2.4x. The
-  rows that press well are the verbose ones, so a corpus of terse answers is
-  the wrong source.
-
-## Performance
-
-- Runtime SIMD dispatch. The vector width is chosen at compile time, so a binary
-  built with `-march=native` will not run on an older host. Function multi-
-  versioning would let one binary pick its width at startup.
-- An AVX-512 VNNI path for the q8 dot product, and an AMX path where available.
-- Memoise activation quantisation. In q8 mode the same activation block is
-  packed once per plane that consumes it — three times in attention, twice in
-  the feed forward. One pack per block would remove roughly a third of the
-  quantisation work.
-- Pack weight panels for prefill. `dense` streams rows in their stored layout;
-  a blocked panel layout would improve cache reuse at large batch widths.
-- Fuse the attention score row. Scores are materialised per head before the
-  softmax; a flash-style tiling would keep them in registers and cut the scratch
-  that grows with context.
-- Store the key/value cache at half width. It is f32 today, which is the
-  dominant term in state memory at long context.
-- Prefetch and NUMA placement for the weight mapping on large hosts.
-
-## Formats
-
-- q4 weights, for hosts where 3 GiB is still too much.
-- Per-channel rather than per-block scales as an alternative q8 layout, to be
-  measured against the current one.
-- Write a packed engine file, so a q8 repack can be done once rather than at
-  every load. Reading Hugging Face folders directly stays the default.
-
-## Architecture coverage
-
-- The mixture-of-experts variant (`model_type: "lfm2_moe"`).
-- The vision variant (`model_type: "lfm2_vl"`).
-- Rotary scaling types beyond `default` and `linear` — `yarn`, `llama3`,
-  `dynamic`. The loader warns and falls back to plain rotary today.
-- Sliding window attention, if a future member of the family uses it. The layer
-  plan already carries a per-layer kind.
-- Batched sequences: several states advanced in one forward pass, which would
-  turn many single-token decodes into one wide matrix multiply.
-
-## Tokenizer
-
-- Unigram and WordPiece models, and the Metaspace pre-tokenizer. Currently
-  reported as `ILL_VOCAB` rather than approximated.
-- Replace the character-class range table with generated Unicode property
-  tables. Runes below `0x80` follow the exact ASCII rule; above it, a rune is a
-  letter unless it falls in a listed range of spaces, punctuation, or symbols.
-  The ranges cover ordinary prose but not every script.
-- Evaluate the Jinja `chat_template` for the subset that chat templates actually
-  use, so prompt shaping comes from the checkpoint rather than from detection.
-- Speed the added-token scan. It is linear in the number of added tokens at
-  every input position; an Aho-Corasick automaton would make it linear in the
-  input.
+The order comes from where the time goes, and the cost split in `CHANGES.md`'s
+standing results is the argument for it. Decode reads every weight once a
+token, so its rate is bytes over bandwidth and there are only two moves: read
+fewer bytes, or get more than one token out of a read. Both have now been made
+once — q4 for the first, `--draft` for the second — and both left something
+behind. q4 came off the memory ceiling and is now held by its own kernel, and
+it gives up on confident text what it saves in bytes; `--draft` only engages
+for greedy sampling, which is not how most callers decode. The items at the
+top are those two debts. Prefill is arithmetic bound and still has room.
+Everything below that is coverage, reliability and reach.
 
 ## Engine
 
-- Implement a device backend against the existing `IllBackend` seam. The seam
-  is in place and the CPU backend is the reference implementation of it, but
-  nothing has been written on the other side of it yet.
-- Save and restore a prompt cache to disk, so a long shared prefix is paid for
-  once.
-- Speculative decoding with a smaller draft model.
-- Replay-based `ill_state_crop` for models with convolution layers. A partial
-  rewind currently reports `ILL_STATE` because the convolution window is
-  recurrent.
-- Streaming decode of partial UTF-8. A token that ends mid-sequence is written
-  as-is; buffering the tail would avoid a transient replacement character in
-  terminal output.
+1. **A q4 that survives text the model is sure about.** q4 reads 0.55 of what
+   q8 reads and decodes 1.23x faster, and on ordinary prose it costs nothing a
+   perplexity can see — but on text the model should find easy it nearly
+   doubles perplexity, 0.68 nats a token to 1.26. That is where four bits over
+   a 32 value block goes: not into the model's uncertainty, into its
+   confidence. Narrowing the block, or spending a second scale on the rows that
+   matter, or an importance-weighted pack that fits where the activations
+   actually are, would each buy some of it back. Sparing the output head does
+   not — it was measured and it is worse; see the refusal register before
+   trying it.
+
+2. **Speculative sampling above temperature zero.** `--draft` refuses to
+   engage unless sampling is greedy, because accepting a candidate on the
+   ground that it equals an argmax is not a test a distribution can pass, and
+   a repetition penalty rewrites the row it is applied to. Most callers do not
+   decode greedily, so most callers get none of what drafting is worth. The
+   fix is the standard one — accept a candidate with probability
+   `min(1, p_target/p_draft)` and resample from the residual when it is
+   rejected — and it needs the draft to carry a distribution rather than a
+   bare token, which an n-gram scan does not have. Decide what a match is
+   worth as a probability before writing any of it; that choice is the whole
+   design.
+
+3. **Take q4 off the kernel ceiling.** q4 decode is the first thing in this
+   engine that is not waiting on memory: 11.9 tok/s over 1.57 GiB is 20.0 GB/s
+   against a 36.6 GB/s sweep, so a third of the machine's bandwidth is idle
+   while the unpack and the dot catch up. The byte count says 1.8x and the
+   measurement says 1.23x, and the difference is all arithmetic. It is also why
+   q4 prefill is 0.93x of q8's, since prefill has no arithmetic to spare. Fewer
+   instructions per unpacked block is the whole of it.
+
+4. **Fuse the attention score row.** Scores are materialised per head before
+   the softmax, so the scratch grows with context and the row is written and
+   read again for no reason. A flash-style tiling with a running maximum and a
+   running sum keeps the row in registers, and it is the difference between
+   attention that fits in cache at long context and attention that does not.
+   **Decision**: the running softmax sums in a different order, so the output
+   moves; re-take the parity run and say so.
+
+5. **Pack the weight panel for prefill.** `dense` streams weight rows in their
+   stored layout, so a prefill wide enough to reuse a panel still re-reads it
+   from wherever it fell out to. A blocked panel layout would keep the reused
+   half in cache. The companion move — fusing more activation rows against one
+   weight row — is spent: eight is where the registers run out on a machine
+   with thirty-two of them, and sixteen measured level with four.
+
+6. **An AMX path for the q8 dot where the host has one.** The VNNI path folds
+   four byte products into a lane; AMX does a tile at a time and is the next
+   step up on the hosts that carry it. It is worth less than it looks on a
+   single sequence — AMX wants many activation rows to fill a tile, so this is
+   a prefill item and a batching item, not a decode item.
+
+7. **Store the key/value cache at half width.** It is f32 today, which is the
+   dominant term in state memory once the context is long — a 4096 token state
+   is 0.15 GiB and the window the checkpoint advertises is 131072. bf16 halves
+   it for a rounding error the keys and values already carry, since they were
+   bf16 in the checkpoint. **Decision**: the scores change in the last bits, so
+   the output moves.
+
+8. **Runtime SIMD dispatch.** The vector width is chosen at compile time, so a
+   binary built with `-march=native` faults on an older host and a binary built
+   to be portable leaves half the machine unused. This matters more now than it
+   did: the fastest path is gated on VNNI, so the gap between the portable
+   build and the native one is wider than it was. Compiling the kernel set once
+   per width with a target attribute and choosing at startup gives one binary
+   that runs everywhere at the width the host actually has. It is a reliability
+   item before it is a speed item — the failure it removes is a crash with no
+   diagnosis.
+9. **Rewind into the middle of a pass.** A mark can only be returned to at
+   the point it was taken, so a round that rejects a proposal drops the
+   confirmed tokens back into the next round's pass and carries them there.
+   That costs nothing in weight reads — the pass was going to happen — but it
+   widens every pass while the carry lasts, and a carry that reaches the cap
+   spends a whole pass committing. Keeping the convolution signal for each
+   token of a batch, rather than only the window at its end, would let the
+   state stop exactly where the acceptance did. It is `conv_count * dim`
+   floats a token, so it is only affordable while a batch is small, which a
+   drafted batch is.
+
+
+10. **Prefetch the next panel while the current one is in flight.** Decode
+    streams gigabytes a token along an entirely predictable stride, and cores
+    waiting on that stride are cores doing nothing. Issuing a prefetch for the
+    rows a chore will reach next costs one instruction per cache line. Pair it
+    with NUMA-aware placement of the weight mapping on hosts with more than one
+    node, where the wrong node doubles the latency of every one of those reads.
+    This is the one item that could still find something in the decode kernel,
+    and the margin it is chasing is small — see the cost split.
+
+11. **Save and restore a prompt cache to disk.** A long shared prefix — a
+    system message, a document, a code file — is paid for at every start
+    today. Writing the state after the prefix and reading it back turns the
+    second run's prefill into a file read. The identity that says a cache
+    belongs to this prompt must be two independent mixes over the same bytes
+    with the shape compared beside them, as the keep file already is.
+
+12. **Grammar-constrained sampling.** A mask over the logits that admits only
+    tokens keeping the output valid against a grammar makes a malformed answer
+    impossible rather than unlikely, which is worth more than any retry loop.
+    Tool calling and JSON replies are the cases; the sampler layer is where the
+    mask belongs, and the tokenizer already has the piece table the mask needs.
+    Keep it to a grammar the engine can compile itself — no dependency.
+
+13. **Per-channel rather than per-block q8 scales**, as an alternative layout to
+    be measured against the current one. It trades a scale read per row for a
+    scale read per block and may quantise better on rows with a flat range.
+    There is a second reason to look now: the paired dot spends three of its
+    eight operations building the two block scales into one vector, and a
+    layout with fewer scales in play would not need them.
+
+14. **Write a packed engine file**, so a q8 or q4 repack is done once rather
+    than at every load. Reading Hugging Face folders directly stays the
+    default; this is a second path, not a replacement, and it must carry enough
+    identity that a stale pack is detected rather than used.
+
+15. **Rotary scaling types beyond `default` and `linear`** — `yarn`, `llama3`,
+    `dynamic`. The loader warns and falls back to plain rotary, which silently
+    produces wrong positions past the training window on a checkpoint that uses
+    one of these. This is a correctness gap wearing a coverage item's clothes.
+
+16. **Sliding window attention**, if a member of the family uses it. The layer
+    plan already carries a per-layer kind, so it is a third case rather than a
+    change of shape.
+
+17. **The mixture-of-experts variant** (`model_type: "lfm2_moe"`). A router and
+    a per-token expert selection, which also makes the weight read per token
+    depend on the routing — the one place in this engine where decode stops
+    being a fixed stride.
+
+18. **Batched sequences: several states advanced in one forward pass**, which
+    turns many single-token decodes into one wide matrix multiply. This is the
+    serving item: it does nothing for one user and most of what a server needs.
+    `ill_state_mark` did the harder half of it, and item 6 wants it.
+
+19. **Speed the added-token scan.** It is linear in the number of added tokens
+    at every input position, and the published checkpoint has 124 of them. An
+    Aho-Corasick automaton makes it linear in the input instead.
+
+20. **Evaluate the Jinja `chat_template`** for the subset chat templates
+    actually use, so prompt shaping comes from the checkpoint rather than from
+    detecting `<|im_start|>` in the vocabulary. Detection is a guess that
+    happens to be right on this family; a checkpoint that shapes turns
+    differently would be shaped wrongly and produce plausible nonsense.
+
+21. **Replace the character-class range table with generated Unicode property
+    tables.** Runes below `0x80` follow the exact ASCII rule; above it a rune is
+    a letter unless it falls in a listed range, and the ranges cover ordinary
+    prose rather than every script. A checkpoint tokenised in a script outside
+    them splits differently to the reference.
+
+22. **Unigram and WordPiece tokenizer models, and the Metaspace pre-tokenizer.**
+    Reported as `ILL_VOCAB` rather than approximated, which is the right
+    refusal and still a refusal.
+
+23. **Implement a device backend against the existing `IllBackend` seam.** The
+    seam is in place and the CPU backend is the reference implementation of it;
+    nothing has been written on the other side. Six operations is the whole
+    surface.
+
+## Verification
+
+24. **Build and run the test suite on arm64.** The NEON instantiation of the
+    vector vocabulary has not been compiled on hardware, and it now carries a
+    paired dot that nothing has exercised there. On MSVC/arm64 the engine also
+    still takes the single threaded fallback: the atomic shim's loads are plain
+    volatile reads, which are acquire on x86 but not under `/volatile:iso` on
+    arm64, and `ill_cpu_pause` has no MSVC arm64 arm. Both need real barriers
+    before that target can enable the pool. **Blocked** on an arm64 host.
+
+25. **Run the caveman tune against the published weights.** The pipeline is
+    verified end to end on a synthetic six layer checkpoint carrying the real
+    tokenizer and chat template; what is missing is the number for what the
+    register costs in accuracy. **Blocked**: it needs a card, not a change.
+
+26. **Run the abliteration against the published weights.** The drive is
+    verified end to end on a synthetic four layer checkpoint over the real
+    128000 entry vocabulary; what is missing is the pair of numbers that says
+    what it bought and what it cost — refusals on the held out harmful prompts
+    beside the base's, and a `--check` afterwards to say whether the register
+    and the answers survived the edit. The search costs a hundred generations
+    and a hundred forward passes per trial over two hundred trials.
+    **Blocked**: it needs a card, not a change.
+
+27. **Grow `data/tune.jsonl` past its 202 hand written rows** with `--make-data`
+    against a published reasoning corpus. The press is deletion only and takes
+    about 29% off the prose it is given, which is the floor rather than the
+    ceiling: a hand written caveman answer restructures and reaches 2.4x. The
+    rows that press well are the verbose ones, so a corpus of terse answers is
+    the wrong source.
+
+## Research
+
+Each item carries what kind of claim it is, what it does to the output, the
+risk that would sink it, and the stop rule that ends the experiment. None of
+these is scheduled; they are here so the next person does not have to find them
+again.
+
+28. **Draft with the model's own q4 weights, verify with its q8 weights.**
+    *Adaptation* (QuantSpec and ML-SpecQD do this on cards),
+    *model-preserving* — the verifier decides every token, so the text is the
+    q8 text. One checkpoint, two planes over the same rows, and the draft costs
+    half the bytes of the verifier. It is a better fit here than a draft model
+    because there is no second checkpoint to ship and the draft agrees with the
+    verifier by construction rather than by training. **Risk**: the extra pass
+    is only worth it if runs of accepted tokens are long, and q4 drift on a
+    2.6B model may be enough to break them. **Experiment**: `--draft` already
+    marks, verifies and rewinds, so this is a second weight plane and a draft
+    pass where the n-gram scan sits; draft four tokens and record the mean
+    accepted run over the tuning corpus. **Stop rule**: abandon if the mean
+    accepted run is below 1.6 tokens at k=4, which is where the second weight
+    read stops paying for itself.
+
+29. **A shortlist for the vocabulary head.** *Hypothesis*, *model-preserving if
+    a bound is carried, approximate otherwise*. The head is 128000 rows of
+    2048, which at q8 is 262 MB of the 2.83 GiB a token reads — near a tenth
+    of decode, spent to rank a vocabulary from which one token is taken.
+    Cluster the rows once at load, score the cluster centroids, and expand only
+    the clusters whose bound can still contain the maximum. **Risk**: the
+    bound is loose enough that most clusters expand anyway, and the clustering
+    costs more at load than it returns. **Experiment**: build the centroids,
+    measure the fraction of rows actually touched per step at greedy and at
+    top-p 0.95. **Stop rule**: abandon if more than 40% of rows are touched, at
+    which point the scattered reads cost more than the sequential ones saved.
+
+30. **Training-free activation sparsity.** *Adaptation* (TEAL), *approximate*.
+    Magnitude-thresholding the hidden state before each projection lets a row
+    whose activation is zero skip its weight read entirely, and the published
+    result is 40-50% sparsity for a small accuracy cost on Llama-class models.
+    **Risk**: the win needs a gather, and a gather over a memory bound stream
+    can cost more than the sequential read it replaces — this is the failure
+    mode that makes CPU sparsity papers rarer than GPU ones. **Experiment**:
+    apply it to the feed forward only, where the SwiGLU gate already says which
+    rows are small. **Stop rule**: abandon if decode gains less than 1.15x at
+    the sparsity where `perplexity` rises by less than 0.1.
+
+31. **Lookup-table mixed-precision matrix multiply.** *Adaptation* (T-MAC),
+    *model-preserving* — exact for the format it implements. Below q8, a dot
+    product can be a table lookup rather than a multiply: precompute every
+    product of an activation block against the 16 possible q4 nibbles, then
+    index. **Risk**: the table has to stay in the fastest cache or the random
+    access costs more than the multiply saved, which is the whole difficulty.
+    **Experiment**: against `ill_dense_nib`'s dot, which q4 now provides.
+    **Stop rule**: abandon if it does not beat the direct q4 dot by 1.2x on
+    decode.
+
+32. **Keys quantised per channel, values per token.** *Established* (KIVI),
+    *approximate*. Keys carry a few channels with very large magnitudes that
+    dominate a per-token range; values do not. Quantising each along the axis
+    that suits it is what makes a 4-bit key/value cache hold accuracy where a
+    naive one does not. **Risk**: a per-channel key scale is read across the
+    grain of the score loop, which may cost more than the narrower cache saves.
+    **Experiment**: after item 7, extend it downward. **Stop rule**: abandon
+    below 8 bits if perplexity rises by more than 0.05.
+
+33. **Skip attention layers to make a self-draft.** *Hypothesis*, approximate
+    as a draft and *model-preserving* in what it emits, since the pass verifies.
+    Twenty-two of the thirty layers are convolution, whose cost does not grow
+    with context; the eight attention layers are the ones that do. A draft that
+    runs the convolution layers and skips some of the attention ones is cheap
+    in exactly the place a long context is expensive. **Risk**: attention is
+    where this architecture does its recall, so a draft without it may agree
+    only on function words. **Experiment**: drop the last four attention
+    layers from the draft pass and record the mean accepted run. **Stop rule**:
+    the same as item 28 — below 1.6 tokens at k=4, it does not pay.
+
+## Non-text media
+
+The model this engine was written for has no vision tower and no audio tower,
+so nothing here is reachable from the published checkpoints. These sit last for
+that reason, not because the work is small.
+
+34. **The vision variant** (`model_type: "lfm2_vl"`). A patch embedding and an
+    image tower ahead of the same stack, and a second token stream to splice
+    into the prompt.
+
+35. **An audio front end**, if a member of the family grows one. The same shape
+    of problem as the vision tower: a separate encoder whose output joins the
+    text stream as embeddings rather than as tokens.

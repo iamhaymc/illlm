@@ -12,9 +12,10 @@ Two modes:
               No download is needed, so it runs anywhere transformers does.
 
   checkpoint  `--model PATH` points at a real checkpoint.  The default is the
-               `ckpt/lfm2.5-0.4b` folder at the repo root, which carries the published
-              LFM2.5-350M weights; `ckpt/lfm2.5-2.6b-a` holds the larger
-              checkpoint.  Against it the suite adds a tokenizer agreement
+              `ckpt/lfm2.5-2.6b-a` folder at the repo root, which is the only
+              checkpoint here this engine can run -- the others are an encoder
+              and a vision-language model.  Against it the suite adds a
+              tokenizer agreement
               check, a throughput comparison -- the engine's `bench` beside
               transformers doing the same shape of work at the same weight
               width -- and a greedy continuation compared on the text, judged
@@ -41,10 +42,12 @@ import time
 
 # The published checkpoints ship in the repository under ckpt/, so the
 # checkpoint suite runs by default; pass --model to point somewhere else, or
-# --no-checkpoint to skip it entirely.  The default is the smallest checkpoint,
-# ckpt/lfm2.5-0.4b (LFM2.5-350M); ckpt/lfm2.5-2.6b-a holds the larger one.
+# --no-checkpoint to skip it entirely.  The default is ckpt/lfm2.5-2.6b-a,
+# which is the only checkpoint in the repository this engine can run: the
+# others are an encoder (Lfm2BidirectionalForMaskedLM) and a vision-language
+# model (lfm2_vl), and this engine is a causal decoder for lfm2.
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "ckpt", "0.4b")
+                             "ckpt", "lfm2.5-2.6b-a")
 
 # ---------------------------------------------------------------------------
 # harness
@@ -310,25 +313,35 @@ def check_storage(binary, root, filter_text):
 
 
 def check_quant(binary, root, filter_text):
-    """q8 is lossy by design, so it is judged on agreement, not on distance."""
+    """A block format is lossy by design, so it is judged on agreement with the
+    reference rather than on distance from it.
+
+    q4 is held to a looser bar than q8 because four bits over a 32 value block
+    is about eight times q8's step. The bar is not a prediction: what the format
+    costs in accuracy is a perplexity number, and `app_main perplexity` is where
+    that is taken. This check is here to catch a packing bug, which looks like
+    agreement collapsing rather than like a tenth of a nat.
+    """
     import numpy as np
 
-    label = "storage/q8_repack"
-    if filter_text and filter_text not in label:
-        return
-    announce(label, "top-1 agreement and correlation")
-    folder, vocab_size = build_model(root, "quant", SHAPES["hybrid_stack"])
-    ids = token_run(vocab_size, 16)
-    want = reference(folder, ids)
-    got = engine_rows(binary, folder, ids, vocab_size, "--every", "--quant", "q8")
-    agree = float((want.argmax(axis=1) == got.argmax(axis=1)).mean())
-    a = want - want.mean(axis=1, keepdims=True)
-    b = got - got.mean(axis=1, keepdims=True)
-    scale = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
-    live = scale > 0
-    tie = float(np.mean((a[live] * b[live]).sum(1) / scale[live])) if live.any() else 1.0
-    record(label, agree >= 0.75 and tie > 0.99,
-           f"top-1 {agree:.0%}, correlation {tie:.4f}")
+    for flavour, floor, tie_floor in (("q8", 0.75, 0.99), ("q4", 0.50, 0.95)):
+        label = f"storage/{flavour}_repack"
+        if filter_text and filter_text not in label:
+            continue
+        announce(label, "top-1 agreement and correlation")
+        folder, vocab_size = build_model(root, "quant", SHAPES["hybrid_stack"])
+        ids = token_run(vocab_size, 16)
+        want = reference(folder, ids)
+        got = engine_rows(binary, folder, ids, vocab_size, "--every",
+                          "--quant", flavour)
+        agree = float((want.argmax(axis=1) == got.argmax(axis=1)).mean())
+        a = want - want.mean(axis=1, keepdims=True)
+        b = got - got.mean(axis=1, keepdims=True)
+        scale = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+        live = scale > 0
+        tie = float(np.mean((a[live] * b[live]).sum(1) / scale[live])) if live.any() else 1.0
+        record(label, agree >= floor and tie > tie_floor,
+               f"top-1 {agree:.0%}, correlation {tie:.4f}")
 
 
 def check_threads(binary, root, filter_text):
@@ -594,11 +607,13 @@ def check_throughput(binary, folder, filter_text):
            f"reference prefill {their_fill:.1f}, decode {their_step:.1f}")
 
 
-def engine_generate(binary, folder, ids, steps):
+def engine_generate(binary, folder, ids, steps, draft=0):
     """Greedy continuation from raw ids, returned as text."""
     cmd = [binary, "generate", "--model", folder, "--raw",
            "--tokens", ",".join(str(i) for i in ids),
            "--max-tokens", str(steps), "--temp", "0", "--quiet"]
+    if draft:
+        cmd += ["--draft", str(draft)]
     done = subprocess.run(cmd, capture_output=True, text=True)
     if done.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)}\n{done.stdout}\n{done.stderr}")
@@ -692,6 +707,50 @@ def check_greedy(binary, folder, filter_text):
            f"{their_share}: {my_text[:60]!r}")
 
 
+def check_draft(binary, folder, filter_text):
+    """Drafting must not change a single character of what greedy emits.
+
+    `--draft` verifies proposed tokens inside one forward pass and returns the
+    state to a mark whenever a proposal is rejected, so it exercises
+    `ill_state_mark`, `ill_state_back` and the convolution window they copy.
+    Every token it emits is still the one the model's own row chose, so the
+    check is exact equality against the same run without it, not a tolerance.
+
+    It runs against the checkpoint rather than a synthetic model on purpose.
+    A model with random weights tends to settle on one token, which a draft
+    proposes and the model then accepts every time -- the rewind is never
+    reached and the check passes whatever the rewind does. Against a trained
+    checkpoint, proposals are accepted and rejected in turn, and breaking the
+    window restore parts the two runs.
+
+    The prompt asks for something repeated so the scan has matches to find, and
+    two widths are run so both the carry and the commit path are reached.
+    """
+    label = "checkpoint/draft"
+    if filter_text and filter_text not in label:
+        return
+    announce(label, "--draft 4 and 8 against plain greedy, exact equality")
+    text = ("List the first eight prime numbers, then list them again in reverse "
+            "order, then explain what a prime number is.")
+
+    def emit(*extra):
+        cmd = [binary, "generate", "--model", folder, "--prompt", text,
+               "--max-tokens", str(STEP_TOKENS), "--temp", "0", "--quiet", *extra]
+        done = subprocess.run(cmd, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd)}\n{done.stderr}")
+        return done.stdout
+
+    plain = emit()
+    detail = []
+    for width in (4, 8):
+        drafted = emit("--draft", str(width))
+        if drafted != plain:
+            detail.append(f"draft {width} parts at character "
+                          f"{shared_prefix(drafted, plain)} of {len(plain)}")
+    record(label, not detail, "identical" if not detail else "; ".join(detail))
+
+
 # ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
@@ -702,7 +761,7 @@ def main():
     parser.add_argument("--binary", default="./build/app_main",
                         help="path to the compiled CLI (default ./build/app_main)")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="checkpoint folder to test against (default ./ckpt/lfm2.5-0.4b)")
+                        help="checkpoint folder to test against (default ./ckpt/lfm2.5-2.6b-a)")
     parser.add_argument("--no-checkpoint", action="store_true",
                         help="skip the checkpoint suite even when ./ckpt/lfm2.5-0.4b exists")
     parser.add_argument("--filter", default=None, help="only run checks whose name contains this")
@@ -764,6 +823,7 @@ def main():
             check_checkpoint(args.binary, args.model, args.filter)
             check_throughput(args.binary, args.model, args.filter)
             check_greedy(args.binary, args.model, args.filter)
+            check_draft(args.binary, args.model, args.filter)
     finally:
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)

@@ -24,12 +24,12 @@ Five source files, flat, no build system, plus the published checkpoints in
 | --- | --- | --- |
 | `app/core.c` | ~4500 | the engine: a header and its implementation in one file |
 | `app/main.c` | ~670 | the command line, six verbs |
-| `test/test.c` | ~800 | unit tests over the engine internals |
+| `test/test.c` | ~1050 | unit tests over the engine internals |
 | `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
 | `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
 | `data/tune.jsonl` | 202 rows | the tuning corpus |
-| `ckpt/` | — | the published checkpoints: `ckpt/lfm2.5-0.4b` (LFM2.5-350M), `ckpt/lfm2.5-2.6b-a` (LFM2.5-2.6B) |
+| `ckpt/` | — | the checkpoints; `ckpt/lfm2.5-2.6b-a` is the one this engine runs |
 
 `app/main.c` and `test/test.c` each begin with `#include "core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
@@ -251,6 +251,31 @@ That leaves exactly one horizontal reduction per output row. On AVX-512BW a
 32-value block widens to precisely one register of int16, so a block costs a
 single multiply-add.
 
+q4 is the same block with the values at half the width, two to a byte: sixteen
+bytes and one scale where q8 spends thirty-two and one. The block's largest
+value is placed exactly on -8, so all sixteen levels are used and the scale
+carries a sign. A block lifts into the signed bytes the q8 dot already reads —
+and on any machine with vectors it lifts straight into the register, never
+through memory.
+
+Where VNNI is present the loop takes blocks in pairs instead, because two
+blocks are 64 bytes and that is one 512 bit register whole:
+
+```
+acc = fma( cvt_f32(dpbusd(|w_pair|, a_pair * sign(w_pair))),
+           [scale_lo x8, scale_hi x8], acc )
+```
+
+`vpdpbusd` folds four byte products into a lane against `vpmaddwd`'s two, and
+it reads bytes directly, so the two widenings disappear as well — which on a
+host bound by instruction issue is the larger half of the saving. Its left
+operand is unsigned, so the weights go in as magnitudes and their sign moves
+onto the activations; AVX-512 has no `vpsignb`, so that move is `vpmovb2m` and
+a masked negate. Lanes 0..7 then carry the low block and lanes 8..15 the high
+one, which is why the scale goes in as a vector of two halves rather than a
+broadcast. Everything without VNNI folds the pair back into two single block
+steps in the same order, so only a VNNI build's output moves.
+
 ### part 6 — json reader
 
 A compact DOM. Every node is an index into one flat array and every string is
@@ -419,11 +444,18 @@ app_main generate  continue a prompt and stream the completion
 app_main chat      interactive conversation on stdin
 app_main logits    write logits, the hook test/test.py compares against
 app_main bench     time prefill and decode
+app_main perplexity  score a text, so an accuracy trade has a number
 ```
 
 `app_main help` lists every flag. Three are worth knowing:
 
-- `--quant q8` repacks at load: half the memory, roughly double the decode rate.
+- `--quant q8` repacks at load: half the memory, roughly double the decode
+  rate. `--quant q4` halves it again for 1.23x q8's decode, at an accuracy
+  cost that is invisible on prose and severe on text the model is sure about.
+- `--draft N` proposes `N` tokens from the context and verifies them in the
+  same pass, which is worth about a quarter on work whose answer quotes its
+  question and nothing on work that invents every token. Greedy only, and the
+  text is byte for byte the text without it.
 - `--raw` feeds the prompt verbatim instead of shaping a chat turn around it.
 - `--tokens 1,2,3` supplies ids directly, which is how the engine is exercised
   against a checkpoint whose tokenizer it cannot read.
@@ -432,21 +464,33 @@ app_main bench     time prefill and decode
 feed the first `N` tokens as one batch and the rest one at a time. That second
 mode exists so the test suite can check the caches rather than only the maths.
 
+`perplexity` reads a text from stdin or `--prompt` and reports the mean
+negative log likelihood it assigns to each token given everything before it,
+in nats, in bits, and as its exponent. It scores the text as it stands — no
+chat template is wrapped around it even without `--raw`, because the template's
+own tokens are not what the number is for. It exists so that a change which
+trades accuracy for speed can be judged rather than argued about; the cost of
+`--quant q8` is the first thing it was pointed at.
+
 ---
 
 ## 6. How correctness is established
 
 Three layers, each catching what the others cannot.
 
-**`test/test.c` — 73 unit checks.** Number formats against their definitions;
+**`test/test.c` — 119 unit checks.** Number formats against their definitions;
 the JSON reader against nested documents, escapes, surrogates, and eight
 malformed inputs; every kernel against a plain-C restatement of the same
-arithmetic written independently in the test; rotary, attention, and
-convolution against direct transcriptions of their equations, including the
-convolution window carried across calls; the thread pool for exact-once
-execution over many widths and repeated forks; the pre-tokenizer chunk by
-chunk; the merge heap; and the sampler for seed replay, nucleus containment,
-and repetition demotion.
+arithmetic written independently in the test, at every tile width the dispatch
+instantiates; the paired q8 dot against the two single block dots it stands
+for; rotary, attention, and convolution against direct transcriptions of their
+equations, including the convolution window carried across calls; the thread
+pool for exact-once execution over many widths and repeated forks; the
+pre-tokenizer chunk by chunk; the merge heap; the row normaliser a score is
+built on; the rule that decides when a streamed character is whole; the scan
+that drafts a continuation from the context; the q4 pack and both of its
+lifts; and the sampler for seed replay,
+nucleus containment, and repetition demotion.
 
 **`test/test.py` — 19 comparisons against `transformers`.** Small Liquid
 checkpoints are built with random weights and run through both implementations.
@@ -469,11 +513,11 @@ Against f32 checkpoints the engine matches to 2e-7 relative — float32 rounding
 UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
 A real checkpoint is tested the same way: `make.py test --model PATH` adds a
-logits comparison and a tokenizer comparison against it. The published
-checkpoints ship in `ckpt/` (`ckpt/lfm2.5-0.4b`, `ckpt/lfm2.5-2.6b-a`),
-with `ckpt/lfm2.5-0.4b` (LFM2.5-350M) the default, so this runs by default, and it adds
-two
-further checks the synthetic suite cannot make:
+logits comparison and a tokenizer comparison against it, for 25 comparisons in
+all. The published checkpoints ship in `ckpt/` (`ckpt/lfm2.5-2.6b-a-e`,
+`ckpt/lfm2.5-0.5b-x`, `ckpt/lfm2.5-2.6b-a`), with the smallest the default, so
+this runs by default, and it adds two further checks the synthetic suite
+cannot make:
 
 - **throughput** — the engine's `bench` beside transformers doing the same
   shape of work: one batch of 256 tokens, then 64 single-token steps with the
@@ -504,20 +548,26 @@ why q8 nearly doubles it and why threads help until bandwidth saturates.
 Prefill is arithmetic bound. `2 * parameters * tokens` FLOPs, and the tile in
 `dense` decides how close to peak you get.
 
-On the 2.9B synthetic checkpoint, four cores, AVX-512:
+On the published 2.6B checkpoint at q8, four cores at 2.80 GHz, AVX-512 with
+VNNI — the `xeon-2.8` host in `CHANGES.md`'s standing results:
 
-| | weights | prefill | decode |
+| | weights | prefill, 256 tok | decode |
 | --- | --- | --- | --- |
-| bf16 | 5.44 GiB | 38.0 tok/s | 5.2 tok/s |
-| q8 | 3.06 GiB | 37.1 tok/s | 9.0 tok/s |
+| q8 | 2.83 GiB | 32.2 tok/s | 9.7 tok/s |
+| q4 | 1.57 GiB | 30.0 tok/s | 11.9 tok/s |
 
-Roughly 53 GB/s of effective weight traffic in prefill and 28 GB/s in decode,
-and about 230 GFLOP/s — both near what four cores of this class sustain. Decode
-scales 2.4 → 4.6 → 8.9 tok/s over one, two, and four threads.
+Decode there is 32.5 GB/s of weight traffic against a 36.6 GB/s bare memory
+sweep — 89% of what the host can fetch, so the decode kernel has about a tenth
+left in it and everything after that has to read fewer bytes or produce more
+than one token per read. Prefill is 88 G multiply-adds a second and is bound by
+instruction issue, not by memory: its weight stream is well under the sweep.
 
 If you are profiling a change, the order of what to look at is: the `dense`
 inner loop, then the attention score loop at long context, then everything else
-together.
+together. In q8 the inner loop is `ill_q8_pair`, which takes two 32-value
+blocks at once because that is one 512 bit register; `ill_q8_step` is the
+single block form it falls back to for an odd trailing block and on
+instruction sets without VNNI.
 
 ---
 
@@ -539,6 +589,14 @@ dispatch is free.
 Add the enum value, a loader in the vector vocabulary, a case in
 `ILL_DENSE_TYPED`, a case in `ill_plane_row`, and a branch in
 `ill_model_plane`. Nothing else knows the difference.
+
+A *block* format is more than that, because it does not read through the f32
+vocabulary at all: q4 is the worked example — `ill_q4_pack`, a lift, its own
+dense body, and `ill_model_pack` told which format it is packing into. If the
+format is narrower than a byte, make the lift produce a register the dot reads
+rather than a buffer it reloads. That single choice is the difference between
+q4 decoding 1.23x faster than q8 and 1.8x slower; the entry for 1.6.0 has the
+three measurements.
 
 ### A new tokenizer family
 

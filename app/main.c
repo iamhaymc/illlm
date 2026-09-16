@@ -8,6 +8,7 @@
  *   chat      hold a turn by turn conversation
  *   logits    dump raw logits, the hook test/test.py compares against
  *   bench     measure prefill and decode throughput
+ *   perplexity  score a text, so an accuracy trade has a number
  *
  * Every command takes --model PATH, the folder holding config.json, the
  * safetensors shards, and tokenizer.json.  `app_main help` lists the rest.
@@ -33,6 +34,7 @@ typedef struct AppOpts {
     int32_t     stream_mode;
     int32_t     prefill_span;
     int32_t     raw_prompt;
+    int32_t     draft_span;
     int32_t     show_stats;
     int32_t     quiet_load;
     IllTuning   tuning;
@@ -64,11 +66,12 @@ static void app_help(void)
 "  chat                  interactive conversation on stdin\n"
 "  logits                write logits for --prompt or --tokens\n"
 "  bench                 time prefill and decode\n"
+"  perplexity            score stdin or --prompt, in nats and perplexity\n"
 "  help                  this page\n"
 "\n"
 "model options\n"
 "  --model PATH          checkpoint folder (required)\n"
-"  --quant q8|none       repack weights to q8 at load (default none)\n"
+"  --quant q8|q4|none    repack weights to q8 or q4 at load (default none)\n"
 "  --threads N           worker threads (default: host cpu count)\n"
 "  --ctx N               context window in tokens (default 4096)\n"
 "  --batch N             prefill chunk in tokens (default 256)\n"
@@ -81,6 +84,7 @@ static void app_help(void)
 "  --tokens a,b,c        raw token ids instead of text\n"
 "  --raw                 skip the chat template, feed the prompt verbatim\n"
 "  --max-tokens N        reply length cap (default 256)\n"
+"  --draft N             verify N context-drafted tokens a pass (greedy only)\n"
 "\n"
 "sampling options\n"
 "  --temp F              temperature, 0 for greedy (default 0.7)\n"
@@ -123,10 +127,12 @@ static int app_opts_read(AppOpts *opts, int argc, char **argv, int from)
         else if (APP_TAKE("--repeat-span")) opts->tuning.repeat_span = atoi(next);
         else if (APP_TAKE("--seed"))        opts->tuning.seed = strtoull(next, NULL, 10);
         else if (APP_TAKE("--quant"))       opts->weight_type =
-                                              !strcmp(next, "q8") ? ILL_TYPE_Q8 : ILL_TYPE_KEEP;
+                                              !strcmp(next, "q8") ? ILL_TYPE_Q8 :
+                                              !strcmp(next, "q4") ? ILL_TYPE_Q4 : ILL_TYPE_KEEP;
         else if (APP_TAKE("--prefill"))     opts->prefill_span = atoi(next);
         else if (!strcmp(flag, "--every"))  opts->every_logit = 1;
         else if (!strcmp(flag, "--stream")) opts->stream_mode = 1;
+        else if (APP_TAKE("--draft"))       opts->draft_span = atoi(next);
         else if (!strcmp(flag, "--raw"))    opts->raw_prompt = 1;
         else if (!strcmp(flag, "--quiet"))  { opts->quiet_load = 1; opts->show_stats = 0; }
         else {
@@ -246,16 +252,125 @@ static IllResult app_feed_make(AppFeed *feed, const AppOpts *opts, const IllMode
     }
 }
 
-/* -- streaming ------------------------------------------------------------- */
+/* -- streaming -------------------------------------------------------------
+ *
+ * A token's bytes can stop in the middle of a character.  Written straight
+ * out, the terminal draws a replacement character and the next token corrects
+ * it, so text in any multi-byte language flickers as it streams.  `AppTail`
+ * holds the unfinished bytes back until the token that completes them arrives.
+ *
+ * It is a tail, not a buffer: everything that is whole goes out at once, and
+ * at most three bytes are ever held.  If those three are never completed --
+ * because the model emitted a byte that is not valid UTF-8, which a byte level
+ * tokenizer is entitled to do -- `app_tail_flush` releases them as they are.
+ * Nothing is dropped and nothing waits for a continuation that is not coming.
+ * ------------------------------------------------------------------------*/
 
-static void app_piece_show(const IllVocab *vocab, int32_t token)
+typedef struct AppTail {
+    char    hold[4];   /* bytes of a sequence still waiting to be finished    */
+    int32_t held;
+} AppTail;
+
+static void app_tail_open(AppTail *tail) { tail->held = 0; }
+
+static void app_tail_show(AppTail *tail, const IllVocab *vocab, int32_t token)
 {
-    char    text[512];
-    int32_t span = 0;
-    if (ill_vocab_decode(vocab, token, text, (int32_t)sizeof(text), &span) != ILL_OK) return;
-    fwrite(text, 1, (size_t)span, stdout);
-    fflush(stdout);
+    char    text[512 + 4];
+    int32_t span = 0, whole;
+    if (ill_vocab_decode(vocab, token, text + tail->held,
+                         (int32_t)sizeof(text) - tail->held, &span) != ILL_OK) return;
+    if (tail->held) {
+        memcpy(text, tail->hold, (size_t)tail->held);
+        span += tail->held;
+        tail->held = 0;
+    }
+    whole = span - ill_utf8_hold(text, span);
+    if (whole > 0) { fwrite(text, 1, (size_t)whole, stdout); fflush(stdout); }
+    tail->held = span - whole;
+    if (tail->held) memcpy(tail->hold, text + whole, (size_t)tail->held);
 }
+
+/* Releases whatever is still held, valid or not.  Called when a reply ends,
+ * so a run never swallows its own last bytes. */
+static void app_tail_flush(AppTail *tail)
+{
+    if (tail->held) { fwrite(tail->hold, 1, (size_t)tail->held, stdout); fflush(stdout); }
+    tail->held = 0;
+}
+
+/* -- drafting --------------------------------------------------------------
+ *
+ * A decode step reads every weight in the model to produce one token, so the
+ * weights are the whole cost and the token is nearly free.  Feeding several
+ * candidate tokens through the same pass costs one weight read instead of
+ * several, and any candidate the model would have chosen anyway is a token
+ * that came for nothing.
+ *
+ * The candidates come from the text itself: take the last few tokens emitted,
+ * find where that run appeared earlier in the prompt or in what has been
+ * generated, and propose whatever followed it.  No second checkpoint, no
+ * training, no new file.  It pays on work where the answer repeats the
+ * question -- summarising, editing, quoting a document back, rewriting code
+ * that is already on screen -- and costs a memcmp sweep over a few thousand
+ * ids when it does not.
+ *
+ * What is emitted is what greedy decoding emits, because every token is the
+ * one the model's own row chose; the draft only decides which rows get
+ * computed early.  That is why `--draft` refuses to engage above temperature
+ * zero: accepting a candidate because it matches an argmax is not the test a
+ * sampled distribution needs, and quietly biasing sampling toward whatever
+ * appeared earlier in the prompt would be a worse bargain than the speed.
+ * ------------------------------------------------------------------------*/
+
+#define APP_DRAFT_MAX 16   /* most tokens proposed in one round             */
+#define APP_PEND_MAX  16   /* most confirmed tokens carried before a commit */
+
+typedef struct AppDraft {
+    int32_t *seen;    /* every id of the session, prompt and reply alike */
+    int32_t  count;
+    int32_t  room;
+    int32_t  span;    /* tokens to propose, zero when drafting is off    */
+    int32_t  reach;   /* longest run matched on                          */
+} AppDraft;
+
+/* Sets a draft up from the options, and says no rather than quietly sampling
+ * differently: accepting a candidate because it equals an argmax is not a test
+ * a temperature above zero can pass, and a repetition penalty rewrites the row
+ * it is applied to, which a verification pass must do exactly once. */
+static void app_draft_open(AppDraft *draft, const AppOpts *opts)
+{
+    memset(draft, 0, sizeof(*draft));
+    if (opts->draft_span <= 0) return;
+    if (opts->tuning.temperature > 0.0f) {
+        fprintf(stderr, "--draft needs greedy sampling (--temp 0); drafting is off\n");
+        return;
+    }
+    draft->span  = opts->draft_span > APP_DRAFT_MAX ? APP_DRAFT_MAX : opts->draft_span;
+    draft->reach = 3;
+}
+
+static void app_draft_free(AppDraft *draft)
+{
+    ill_block_free(draft->seen);
+    draft->seen = NULL;
+    draft->count = draft->room = 0;
+}
+
+static int app_draft_note(AppDraft *draft, int32_t token)
+{
+    if (draft->count == draft->room) {
+        int32_t  grown = draft->room ? draft->room * 2 : 256;
+        int32_t *fresh = (int32_t *)ill_block_make((size_t)grown * sizeof(int32_t));
+        if (!fresh) return 0;
+        if (draft->seen) memcpy(fresh, draft->seen, (size_t)draft->count * sizeof(int32_t));
+        ill_block_free(draft->seen);
+        draft->seen = fresh;
+        draft->room = grown;
+    }
+    draft->seen[draft->count++] = token;
+    return 1;
+}
+
 
 typedef struct AppRun {
     int32_t made;      /* tokens produced */
@@ -264,19 +379,48 @@ typedef struct AppRun {
     int32_t read;      /* prompt tokens   */
 } AppRun;
 
+/* One decode round with a draft behind it.
+ *
+ * `lead` holds the tokens the state has not absorbed yet -- `pend` of them --
+ * followed by whatever was proposed.  The whole lot goes through one forward
+ * pass.  Rows for the proposed part are checked against the proposal, and the
+ * round ends in one of two states:
+ *
+ *   every proposal accepted -- the state holds exactly the confirmed
+ *     sequence, so the mark moves forward and nothing is carried;
+ *   a proposal rejected -- the state holds tokens that are not going to be
+ *     emitted, so it returns to the mark and the confirmed tokens are carried
+ *     into the next round's pass, where they cost nothing extra because that
+ *     pass was going to read the weights anyway.
+ *
+ * That second case is why one mark is enough.  Returning to the middle of a
+ * batch would need a window the state does not keep; returning to its start
+ * needs only the copy `ill_state_mark` took, and the re-feeding is absorbed by
+ * work already scheduled.  The carry is capped so a long run of rejections
+ * cannot grow the pass without bound.
+ */
 static IllResult app_run_loop(IllModel *model, IllState *state, IllSampler *sampler,
-                              const AppFeed *feed, int32_t reply_span, int show,
-                              AppRun *run)
+                              AppDraft *draft, const AppFeed *feed,
+                              int32_t reply_span, int show, AppRun *run)
 {
     const IllVocab *vocab = ill_model_vocab(model);
+    const int32_t   vocab_size = ill_model_arch(model)->vocab_size;
+    int32_t   lead[APP_PEND_MAX + APP_DRAFT_MAX];
+    AppTail   tail;
     IllBatch  batch;
     float    *logits = NULL;
     IllResult code;
     double    mark;
-    int32_t   step, next;
+    int32_t   next, pend = 0, index;
+    int       done = 0;
 
+    app_tail_open(&tail);
     memset(run, 0, sizeof(*run));
     run->read = feed->count;
+
+    if (draft)
+        for (index = 0; index < feed->count; ++index)
+            if (!app_draft_note(draft, feed->tokens[index])) return ILL_ALLOC;
 
     batch.tokens = feed->tokens;
     batch.count  = feed->count;
@@ -287,21 +431,105 @@ static IllResult app_run_loop(IllModel *model, IllState *state, IllSampler *samp
     if (code != ILL_OK) return code;
 
     mark = ill_clock_now();
-    for (step = 0; step < reply_span; ++step) {
-        next = ill_sampler_pick(sampler, logits);
+    code = ill_state_mark(state);
+    if (code != ILL_OK) goto stop;
+
+    next = ill_sampler_pick(sampler, logits);
+    while (!done && run->made < reply_span) {
+        int32_t want, got, taken, room;
+
         if (next < 0) break;
         if (vocab && ill_vocab_stop(vocab, next)) break;
         ill_sampler_note(sampler, next);
         ++run->made;
-        if (show && vocab) app_piece_show(vocab, next);
-        if (ill_state_fill(state) >= ill_state_span(state)) break;
-        batch.tokens = &next;
-        batch.count  = 1;
+        if (show && vocab) app_tail_show(&tail, vocab, next);
+        if (draft && !app_draft_note(draft, next)) { code = ILL_ALLOC; goto stop; }
+
+        lead[pend++] = next;
+        next = -1;
+
+        /* How many more tokens the window can still hold, counting what is
+         * already carried.  A round that would overrun it is not run. */
+        room = ill_state_span(state) - ill_state_fill(state) - pend;
+        if (room < 0) break;
+
+        want = draft ? draft->span : 0;
+        if (want > APP_DRAFT_MAX) want = APP_DRAFT_MAX;
+        if (want > room) want = room;
+        if (want > reply_span - run->made) want = reply_span - run->made;
+        got = want > 0 ? ill_draft_scan(draft->seen, draft->count, draft->reach,
+                                       lead + pend, want) : 0;
+
+        batch.tokens = lead;
+        batch.count  = pend + got;
+        batch.every  = got > 0;
         code = ill_model_apply(model, state, &batch, &logits);
-        if (code != ILL_OK) return code;
+        if (code != ILL_OK) goto stop;
+
+        if (got == 0) {
+            /* No proposal: the state absorbed everything carried, so the mark
+             * moves and the single row is the next token's. */
+            next = ill_sampler_pick(sampler, logits);
+            code = ill_state_mark(state);
+            if (code != ILL_OK) goto stop;
+            pend = 0;
+            continue;
+        }
+
+        /* Row `pend - 1 + t` is the model's own choice for the slot the t-th
+         * proposal fills.  Each row is picked exactly once: a rejected pick is
+         * carried into the next round rather than taken again, because a
+         * repetition penalty rewrites the row it is applied to. */
+        for (taken = 0; taken < got; ++taken) {
+            float  *row = logits + (size_t)(pend - 1 + taken) * (size_t)vocab_size;
+            int32_t mine = ill_sampler_pick(sampler, row);
+            if (mine != lead[pend + taken]) { next = mine; break; }
+            if (vocab && ill_vocab_stop(vocab, mine)) { done = 1; break; }
+            ill_sampler_note(sampler, mine);
+            ++run->made;
+            if (show && vocab) app_tail_show(&tail, vocab, mine);
+            if (draft && !app_draft_note(draft, mine)) { code = ILL_ALLOC; goto stop; }
+            if (run->made >= reply_span) { done = 1; break; }
+        }
+        if (done) break;
+
+        if (taken == got) {
+            /* Every proposal held, so the state is exactly the confirmed
+             * sequence and the free row after it is the next token's. */
+            next = ill_sampler_pick(sampler,
+                       logits + (size_t)(pend - 1 + got) * (size_t)vocab_size);
+            code = ill_state_mark(state);
+            if (code != ILL_OK) goto stop;
+            pend = 0;
+            continue;
+        }
+
+        /* A proposal was rejected, so the state holds tokens that will not be
+         * emitted.  Go back and carry the confirmed ones forward. */
+        code = ill_state_back(state);
+        if (code != ILL_OK) goto stop;
+        pend += taken;
+
+        if (pend >= APP_PEND_MAX) {
+            /* Carrying any further would widen every pass from here on, so
+             * spend one pass making the state absorb what is carried.  Its row
+             * is discarded: the next token is already decided. */
+            batch.tokens = lead;
+            batch.count  = pend;
+            batch.every  = 0;
+            code = ill_model_apply(model, state, &batch, &logits);
+            if (code != ILL_OK) goto stop;
+            code = ill_state_mark(state);
+            if (code != ILL_OK) goto stop;
+            pend = 0;
+        }
     }
+    code = ILL_OK;
+
+stop:
     run->step_secs = ill_clock_now() - mark;
-    return ILL_OK;
+    if (show && vocab) app_tail_flush(&tail);
+    return code;
 }
 
 static void app_run_note(const AppRun *run)
@@ -374,7 +602,11 @@ static int app_do_tokens(const AppOpts *opts)
 
     if (opts->token_text) {
         if (!app_feed_ids(&feed, opts->token_text)) { ill_model_free(model); return 1; }
-        for (index = 0; index < feed.count; ++index) app_piece_show(vocab, feed.tokens[index]);
+        AppTail tail;
+        app_tail_open(&tail);
+        for (index = 0; index < feed.count; ++index)
+            app_tail_show(&tail, vocab, feed.tokens[index]);
+        app_tail_flush(&tail);
         putchar('\n');
         app_feed_free(&feed);
         ill_model_free(model);
@@ -404,6 +636,7 @@ static int app_do_generate(const AppOpts *opts)
     IllSampler *sampler = NULL;
     AppFeed     feed;
     AppRun      run;
+    AppDraft    draft;
     IllResult   code = app_model_open(opts, &model);
     int         exit_code = 1;
 
@@ -417,13 +650,16 @@ static int app_do_generate(const AppOpts *opts)
     code = ill_sampler_make(&sampler, &opts->tuning, ill_model_arch(model)->vocab_size);
     if (code != ILL_OK) { fprintf(stderr, "sampler failed: %s\n", ill_result_text(code)); goto done; }
 
-    code = app_run_loop(model, state, sampler, &feed, opts->reply_span, 1, &run);
+    app_draft_open(&draft, opts);
+    code = app_run_loop(model, state, sampler, draft.span ? &draft : NULL,
+                        &feed, opts->reply_span, 1, &run);
     if (code != ILL_OK) { fprintf(stderr, "\nrun failed: %s\n", ill_result_text(code)); goto done; }
     putchar('\n');
     if (opts->show_stats) app_run_note(&run);
     exit_code = 0;
 
 done:
+    app_draft_free(&draft);
     app_feed_free(&feed);
     ill_sampler_free(sampler);
     ill_state_free(state);
@@ -437,12 +673,14 @@ static int app_do_chat(const AppOpts *opts)
     IllState   *state = NULL;
     IllSampler *sampler = NULL;
     const IllVocab *vocab;
+    AppDraft    draft;
     IllResult   code = app_model_open(opts, &model);
     char        line[8192];
     int         opened = 0;
     int         exit_code = 1;
 
     if (code != ILL_OK) { fprintf(stderr, "load failed: %s\n", ill_result_text(code)); return 1; }
+    app_draft_open(&draft, opts);
     vocab = ill_model_vocab(model);
     if (!vocab) { fprintf(stderr, "chat needs a tokenizer\n"); goto done; }
 
@@ -493,7 +731,8 @@ static int app_do_chat(const AppOpts *opts)
         if (code != ILL_OK) { fprintf(stderr, "encode failed: %s\n", ill_result_text(code)); break; }
         opened = 1;
 
-        code = app_run_loop(model, state, sampler, &feed, opts->reply_span, 1, &run);
+        code = app_run_loop(model, state, sampler, draft.span ? &draft : NULL,
+                            &feed, opts->reply_span, 1, &run);
         app_feed_free(&feed);
         if (code != ILL_OK) { fprintf(stderr, "\nrun failed: %s\n", ill_result_text(code)); break; }
         putchar('\n');
@@ -502,6 +741,7 @@ static int app_do_chat(const AppOpts *opts)
     exit_code = 0;
 
 done:
+    app_draft_free(&draft);
     ill_sampler_free(sampler);
     ill_state_free(state);
     ill_model_free(model);
@@ -582,6 +822,130 @@ done:
     return exit_code;
 }
 
+/* -- perplexity ------------------------------------------------------------
+ *
+ * How surprised the model is by a text it did not write, in one number.  The
+ * engine had no such number: `--quant q8` was reported as a correlation
+ * against the reference, which says the two agree with each other and not what
+ * either is worth, so nothing that trades accuracy for speed could be landed
+ * on evidence.
+ *
+ * The score is the mean negative log likelihood the model assigns to each
+ * token given everything before it, and perplexity is its exponent.  Every
+ * token but the first is scored, in one left to right pass, so the context a
+ * token is judged on is the whole text up to it rather than a window.  The
+ * pass is cut into chunks only because asking for every row of a long text at
+ * once would allocate the vocabulary once per token.
+ * ------------------------------------------------------------------------*/
+
+/* Reads all of a stream into one heap block.  Returns NULL on failure. */
+static char *app_slurp(FILE *source)
+{
+    size_t room = 65536, fill = 0;
+    char  *text = (char *)ill_block_make(room);
+    if (!text) return NULL;
+    for (;;) {
+        size_t got = fread(text + fill, 1, room - fill - 1, source);
+        fill += got;
+        if (fill + 1 < room) break;
+        {
+            char *grown = (char *)ill_block_make(room * 2);
+            if (!grown) { ill_block_free(text); return NULL; }
+            memcpy(grown, text, fill);
+            ill_block_free(text);
+            text = grown;
+            room *= 2;
+        }
+    }
+    text[fill] = '\0';
+    return text;
+}
+
+static int app_do_perplexity(const AppOpts *opts)
+{
+    IllModel *model = NULL;
+    IllState *state = NULL;
+    char     *body  = NULL;
+    AppFeed   feed;
+    IllResult code  = app_model_open(opts, &model);
+    int32_t   vocab_size, chunk, done, scored = 0;
+    double    total = 0.0;
+    int       exit_code = 1;
+
+    if (code != ILL_OK) { fprintf(stderr, "load failed: %s\n", ill_result_text(code)); return 1; }
+    memset(&feed, 0, sizeof(feed));
+    vocab_size = ill_model_arch(model)->vocab_size;
+
+    /* The text is scored as it stands.  Wrapping it in the chat template would
+     * score the template's own tokens as well, which is not what the number is
+     * for, so `perplexity` does not shape a prompt even without `--raw`. */
+    if (opts->token_text) {
+        if (!app_feed_ids(&feed, opts->token_text)) { code = ILL_ALLOC; goto done; }
+    } else {
+        const IllVocab *vocab = ill_model_vocab(model);
+        if (!vocab) {
+            fprintf(stderr, "this checkpoint has no readable tokenizer; use --tokens\n");
+            goto done;
+        }
+        body = opts->prompt_text ? NULL : app_slurp(stdin);
+        if (!opts->prompt_text && !body) { code = ILL_ALLOC; goto done; }
+        code = app_feed_text(&feed, vocab, opts->prompt_text ? opts->prompt_text : body, 1);
+        if (code != ILL_OK) { fprintf(stderr, "encode failed: %s\n", ill_result_text(code)); goto done; }
+    }
+
+    if (feed.count < 2) {
+        fprintf(stderr, "perplexity needs at least two tokens, got %d\n", feed.count);
+        goto done;
+    }
+    if (feed.count > opts->context_span) {
+        fprintf(stderr, "text is %d tokens and the window is %d; raise --ctx\n",
+                feed.count, opts->context_span);
+        goto done;
+    }
+
+    code = ill_state_make(&state, model, opts->context_span);
+    if (code != ILL_OK) { fprintf(stderr, "state failed: %s\n", ill_result_text(code)); goto done; }
+
+    chunk = opts->batch_span > 0 ? opts->batch_span : 256;
+    for (done = 0; done < feed.count; ) {
+        int32_t span = ILL_MIN(chunk, feed.count - done);
+        float  *rows = NULL;
+        IllBatch batch;
+        int32_t at;
+        batch.tokens = feed.tokens + done;
+        batch.count  = span;
+        batch.every  = 1;
+        code = ill_model_apply(model, state, &batch, &rows);
+        if (code != ILL_OK) { fprintf(stderr, "apply failed: %s\n", ill_result_text(code)); goto done; }
+        /* Row `at` predicts the token after it, so the last token of the text
+         * has no row to be scored against and the last row of a chunk is
+         * scored against the first token of the next one. */
+        for (at = 0; at < span; ++at) {
+            const float *row = rows + (size_t)at * vocab_size;
+            int32_t next = done + at + 1;
+            if (next >= feed.count) break;
+            total += ill_row_logsum(row, vocab_size) - (double)row[feed.tokens[next]];
+            ++scored;
+        }
+        done += span;
+    }
+
+    printf("tokens    %d scored of %d\n", scored, feed.count);
+    printf("weights   %s\n", opts->weight_type == ILL_TYPE_KEEP
+                             ? "as stored" : ill_type_text(opts->weight_type));
+    printf("nll       %.4f nats a token\n", total / (double)scored);
+    printf("bits      %.4f a token\n", total / (double)scored / log(2.0));
+    printf("perplexity %.4f\n", exp(total / (double)scored));
+    exit_code = 0;
+
+done:
+    ill_block_free(body);
+    app_feed_free(&feed);
+    ill_state_free(state);
+    ill_model_free(model);
+    return exit_code;
+}
+
 static int app_do_bench(const AppOpts *opts)
 {
     IllModel *model = NULL;
@@ -624,7 +988,8 @@ static int app_do_bench(const AppOpts *opts)
     step_secs = ill_clock_now() - mark;
 
     printf("weights   %.2f GiB (%s)\n", (double)ill_model_bytes(model) / 1073741824.0,
-           opts->weight_type == ILL_TYPE_Q8 ? "q8" : "as stored");
+           opts->weight_type == ILL_TYPE_KEEP ? "as stored"
+                                              : ill_type_text(opts->weight_type));
     printf("state     %.2f GiB for %d tokens\n",
            (double)ill_state_bytes(state) / 1073741824.0, opts->context_span);
     printf("backend   %s / %s, %d threads\n", ill_model_backend(model),
@@ -665,6 +1030,7 @@ int main(int argc, char **argv)
     if (!strcmp(verb, "chat"))     return app_do_chat(&opts);
     if (!strcmp(verb, "logits"))   return app_do_logits(&opts);
     if (!strcmp(verb, "bench"))    return app_do_bench(&opts);
+    if (!strcmp(verb, "perplexity")) return app_do_perplexity(&opts);
 
     fprintf(stderr, "unknown command: %s\n", verb);
     app_help();
