@@ -1,30 +1,39 @@
-# AGENTS.md
+# AGENTS
 
 How to work in this repository. It is written for an agent picking the project
 up cold, and it describes conventions that are already load-bearing rather than
 preferences — the documents cite each other, the tests are the parity argument,
 and the version log is an archive other files index into.
 
-Read `GUIDE.md` before changing `app_core.c`. Read `CHANGES.md`'s **standing
+Read `GUIDE.md` before changing `app/core.c`. Read `CHANGES.md`'s **standing
 results** before quoting a number or reopening an idea.
 
 ---
 
 ## 1. The files, and what each is for
 
-| file         | what belongs in it                                                        | what must never go in it                            |
-| ------------ | ------------------------------------------------------------------------- | --------------------------------------------------- |
-| `app_core.c` | the whole engine, one translation unit, eleven layers bottom-up           | anything a second file would have to be created for |
-| `app_main.c` | the command line front end                                                | engine logic                                        |
-| `app_test.c` | the unit tests; includes `app_core.c`                                     | anything that needs a checkpoint it cannot make     |
-| `CHANGES.md` | **the archive** — every version, its reasoning, its numbers, its refusals | anything still open                                 |
-| `TODO.md`    | **open items only**, most consequential first                             | progress, rationale, history, closed work           |
-| `README.md`  | what the engine is, how to run it, what the flags do, where it stands     | version archaeology, pass-by-pass narrative         |
-| `GUIDE.md`   | a tour of the implementation, layer by layer                              | performance history                                 |
-| `AGENTS.md`  | this file                                                                 | anything specific to one change                     |
+The source is arranged in three directories: `app/` holds the engine and its
+command line, `test/` holds the two test suites, and `util/` holds the Python
+workflows and the tune. Checkpoints live in `ckpt/`, the tuning corpus in
+`data/`.
 
-The four `.py` files are the reference comparison and the build workflow, not
-part of the engine. `run.py` is the only build system there is.
+| file              | what belongs in it                                                        | what must never go in it                            |
+| ----------------- | ------------------------------------------------------------------------- | --------------------------------------------------- |
+| `app/core.c`      | the whole engine, one translation unit, fifteen layers bottom-up          | anything a second file would have to be created for |
+| `app/main.c`      | the command line front end; includes `core.c`                             | engine logic                                        |
+| `test/test.c`     | the unit tests; includes `../app/core.c`                                  | anything that needs a checkpoint it cannot make     |
+| `test/test.py`    | the reference comparison against `transformers`                           | anything the C unit tests already cover             |
+| `util/make.py`    | install, build, test, run, bench, clean                                   | a second build system                               |
+| `util/tune.py`    | the tune, the caveman rule engine, and the abliteration pass              | anything the engine does at inference               |
+| `data/tune.jsonl` | the tuning corpus, one JSON row per line                                  | anything a generated corpus should hold             |
+| `CHANGES.md`      | **the archive** — every version, its reasoning, its numbers, its refusals | anything still open                                 |
+| `TODO.md`         | **open items only**, most consequential first                             | progress, rationale, history, closed work           |
+| `README.md`       | what the engine is, how to run it, what the flags do, where it stands     | version archaeology, pass-by-pass narrative         |
+| `GUIDE.md`        | a tour of the implementation, layer by layer                              | performance history                                 |
+| `AGENTS.md`       | this file                                                                 | anything specific to one change                     |
+
+The `.py` files are the reference comparison, the build workflow and the tune,
+not part of the engine. `util/make.py` is the only build system there is.
 
 **The file list is closed.** Do not add a source file, a header, or a build
 tool. `RESEARCH.md` used to exist and was folded into the end of `TODO.md`;
@@ -102,7 +111,7 @@ earlier ones.
 
 - A change that is not meant to alter results must be held **bit for bit**, not
   to a tolerance. The comparison is against a binary built from the previous
-  commit (`git archive HEAD app_core.c app_main.c`, build it aside, compare).
+  commit (`git archive HEAD app/core.c app/main.c`, build it aside, compare).
 - Use greedy `chat` text for anything touching the cache path. **`logits` does
   not read `--keep`** — only `main_serve` primes from a keep file — so a
   comparison taken through `logits` tests nothing there.
@@ -123,7 +132,7 @@ earlier ones.
 - Tests state _what the caller may rely on_, not what the code happens to do.
   Name them as sentences.
 - The suite must pass on the default and `--tuned` builds; `--wide` must at
-  least compile. `python run.py test --tuned`.
+  least compile. `python util/make.py test --tuned`.
 
 ## 7. Prose style
 
@@ -155,16 +164,16 @@ consistent across all of them. Match it.
   `_limit` a cap, `_list` an array, `_room` scratch, `_flag` a boolean,
   `_sheet` a weight matrix, `_span` a view the engine does not own.
 - C11, declarations at the top of a block, no VLAs, no compiler extensions
-  outside an intrinsics block guarded by its `APP_SIMD_*` level.
-- The public interface lives inside `APP_CORE_INCLUDED`; everything else is
-  inside `APP_CORE_IMPLEMENTED` and is private.
+  outside an intrinsics block guarded by its `ILL_SIMD_NAME` level.
+- The public interface lives inside `ILL_CORE_INCLUDED`, the include guard at
+  the top of `app/core.c`; everything below it in the same file is private.
 - A layer may depend only on the layers beneath it.
 - Comments above a function explain the decision. Long comments are normal here
   and are the reason the file is readable at fourteen thousand lines.
 
 ## 9. Working on this repository
 
-- Prepend the compiler to `PATH`, then `python run.py test --tuned`. There is no
+- Prepend the compiler to `PATH`, then `python util/make.py test --tuned`. There is no
   other build step.
 - Do not add dependencies. Not one, not for tests, not for tooling.
 - Generate test media rather than downloading it: the engine reads binary PNM,

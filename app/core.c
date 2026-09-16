@@ -1,5 +1,5 @@
 /* ============================================================================
- * app_core.c -- Liquid inference engine.
+ * app/core.c -- Liquid inference engine.
  *
  * A single-translation-unit engine that runs the Liquid Foundation Model (LFM2
  * family) directly from a Hugging Face checkpoint folder: config.json, one or
@@ -9,10 +9,10 @@
  * The file is laid out as a header followed by its implementation.  Callers
  * include it once:
  *
- *     #include "app_core.c"
+ *     #include "core.c"
  *
- * app_main.c and app_test.c both do exactly that, which keeps the project flat
- * while still giving the engine a single, clean, documented API surface.
+ * app/main.c and test/test.c both do exactly that, which keeps the project
+ * flat while still giving the engine a single, clean, documented API surface.
  *
  * Layout
  *   part 1   public interface
@@ -881,8 +881,8 @@ ILL_SPARE static uint16_t ill_f16_pack(float value)
  * so a scalar host and a vector host agree by construction rather than by
  * review.
  *
- * The build picks a width at compile time.  run.py probes the host and passes
- * the matching flags; `run.py build --portable` pins the baseline.
+ * The build picks a width at compile time.  util/make.py probes the host and
+ * passes the matching flags; `make.py build --portable` pins the baseline.
  * ==========================================================================*/
 
 #if defined(ILL_ARCH_X86) && defined(__AVX512F__) && !defined(ILL_NO_SIMD)

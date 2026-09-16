@@ -1,4 +1,4 @@
-# Guide
+# GUIDE
 
 A tour of the implementation: what the engine computes, how the code is
 arranged, and where to change it.
@@ -6,7 +6,7 @@ arranged, and where to change it.
 - [1. The shape of the project](#1-the-shape-of-the-project)
 - [2. What the architecture computes](#2-what-the-architecture-computes)
 - [3. The public API](#3-the-public-api)
-- [4. Inside app_core.c](#4-inside-app_corec)
+- [4. Inside core.c](#4-inside-corec)
 - [5. The command line](#5-the-command-line)
 - [6. How correctness is established](#6-how-correctness-is-established)
 - [7. Where the time goes](#7-where-the-time-goes)
@@ -17,19 +17,21 @@ arranged, and where to change it.
 
 ## 1. The shape of the project
 
-Five source files, flat, no build system, plus the published checkpoint in
-`model/`.
+Five source files, flat, no build system, plus the published checkpoints in
+`ckpt/`.
 
 | file | lines | role |
 | --- | --- | --- |
-| `app_core.c` | ~4460 | the engine: a header and its implementation in one file |
-| `app_main.c` | ~675 | the command line, six verbs |
-| `app_test.c` | ~800 | unit tests over the engine internals |
-| `app_test.py` | ~760 | comparison against Hugging Face `transformers` |
-| `run.py` | ~280 | install, build, test, run, bench, clean |
-| `model/` | — | the published LFM2.5-2.6B checkpoint the test suite runs against |
+| `app/core.c` | ~4500 | the engine: a header and its implementation in one file |
+| `app/main.c` | ~670 | the command line, six verbs |
+| `test/test.c` | ~800 | unit tests over the engine internals |
+| `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
+| `util/make.py` | ~280 | install, build, test, run, bench, clean |
+| `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
+| `data/tune.jsonl` | 202 rows | the tuning corpus |
+| `ckpt/` | — | the published checkpoints: `ckpt/0.4b` (LFM2.5-350M), `ckpt/1.2b` (LFM2.5-1.2B-Instruct), `ckpt/2.6b` (LFM2.5-2.6B) |
 
-`app_main.c` and `app_test.c` each begin with `#include "app_core.c"`. That is
+`app/main.c` and `test/test.c` each begin with `#include "core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
 interface at the top of its implementation, guarded by `ILL_CORE_INCLUDED`.
 Each front end is a single translation unit, which lets the compiler inline the
@@ -38,10 +40,10 @@ whole engine and lets the tests reach the internals they are testing.
 Build any of it with one command:
 
 ```sh
-cc -std=c11 -O3 -march=native app_main.c -o app_main -lm -pthread
+cc -std=c11 -O3 -march=native app/main.c -o app_main -lm -pthread
 ```
 
-`run.py build` does exactly that, after probing which flags the compiler
+`util/make.py build` does exactly that, after probing which flags the compiler
 accepts.
 
 ---
@@ -126,7 +128,7 @@ memory that grows.
 
 ## 3. The public API
 
-Four objects and about thirty calls. Everything is in part 1 of `app_core.c`.
+Four objects and about thirty calls. Everything is in part 1 of `app/core.c`.
 
 ```c
 IllModel     weights, architecture, vocabulary — read only once loaded
@@ -174,7 +176,7 @@ Rules that hold everywhere:
 
 ---
 
-## 4. Inside app_core.c
+## 4. Inside core.c
 
 Fifteen parts, each layered on the ones above it.
 
@@ -228,8 +230,8 @@ The one idea that keeps the kernels short. A dozen inline functions — `zero`,
 
 Every kernel below is written once against this vocabulary. The width-1
 instantiation is not a separate reference implementation that could drift — it
-is the same source, compiled with a vector width of one. `run.py test --no-simd`
-runs the full suite through it, and `run.py test --portable` runs it at width 8,
+is the same source, compiled with a vector width of one. `make.py test --no-simd`
+runs the full suite through it, and `make.py test --portable` runs it at width 8,
 so agreement between widths is checked rather than assumed.
 
 ### part 5 — block quantisation
@@ -415,7 +417,7 @@ app_main info      describe the checkpoint and the load plan
 app_main tokens    encode --prompt, or decode --tokens
 app_main generate  continue a prompt and stream the completion
 app_main chat      interactive conversation on stdin
-app_main logits    write logits, the hook app_test.py compares against
+app_main logits    write logits, the hook test/test.py compares against
 app_main bench     time prefill and decode
 ```
 
@@ -436,7 +438,7 @@ mode exists so the test suite can check the caches rather than only the maths.
 
 Three layers, each catching what the others cannot.
 
-**`app_test.c` — 73 unit checks.** Number formats against their definitions;
+**`test/test.c` — 73 unit checks.** Number formats against their definitions;
 the JSON reader against nested documents, escapes, surrogates, and eight
 malformed inputs; every kernel against a plain-C restatement of the same
 arithmetic written independently in the test; rotary, attention, and
@@ -446,7 +448,7 @@ execution over many widths and repeated forks; the pre-tokenizer chunk by
 chunk; the merge heap; and the sampler for seed replay, nucleus containment,
 and repetition demotion.
 
-**`app_test.py` — 19 comparisons against `transformers`.** Small Liquid
+**`test/test.py` — 19 comparisons against `transformers`.** Small Liquid
 checkpoints are built with random weights and run through both implementations.
 The matrix covers attention-only, convolution-only, and hybrid stacks; grouped
 and multi query attention; tied and untied heads; wide and biased kernels;
@@ -463,12 +465,14 @@ whole stack to zero and would hide real differences.
 
 Against f32 checkpoints the engine matches to 2e-7 relative — float32 rounding.
 
-**Sanitizers.** `run.py test --sanitize` builds with AddressSanitizer and
+**Sanitizers.** `make.py test --sanitize` builds with AddressSanitizer and
 UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
-A real checkpoint is tested the same way: `run.py test --model PATH` adds a
+A real checkpoint is tested the same way: `make.py test --model PATH` adds a
 logits comparison and a tokenizer comparison against it. The published
-LFM2.5-2.6B weights ship in `model/`, so this runs by default, and it adds two
+checkpoints ship in `ckpt/` (`ckpt/0.4b`, `ckpt/1.2b`, `ckpt/2.6b`),
+with `ckpt/0.4b` (LFM2.5-350M) the default, so this runs by default, and it adds
+two
 further checks the synthetic suite cannot make:
 
 - **throughput** — the engine's `bench` beside transformers doing the same

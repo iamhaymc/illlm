@@ -1,0 +1,70 @@
+# The engine has no dependencies and this file does not give it any: nothing
+# under `pyproject.toml` is needed to build `app_main`, to run it, or to run
+# the C unit tests. `python3 util/make.py build` is still a compiler and nothing
+# else.
+#
+# What this file carries is the reference side of the repository -- the `.py`
+# workflow helpers, which run on the other side of the comparison and always
+# have. `util/eval.py` is the one that needs a pinned stack, because the
+# benchmarks it scores are lighteval's: the eval backend (`lighteval eval`,
+# the inspect-ai one) runs the tasks, and this repository's binary is the
+# model under test.
+#
+#     pip install -e .            the benchmark stack
+#     pip install -e ".[reference]"   plus what util/make.py test and util/tune.py want
+#
+# The two direct pins are there for a reason:
+#
+#   lighteval >= 0.13   the version that has the eval backend, `sample_fields`
+#                       on the task configs, and the nine benchmarks this
+#                       repository scores -- `ifbench_test`, `ifeval`,
+#                       `mmlu_pro`, `musr`, `simpleqa`, `agieval`, `babi_qa`
+#                       and `boolq`. inspect-ai arrives with it, and so do
+#                       nltk, numpy and the hub client.
+#   langdetect          IFEval and IFBench refuse to build a sample without
+#                       it: lighteval marks their row mappers `@requires
+#                       ("langdetect")`, and it is in an optional extra of
+#                       lighteval that also pulls spacy and stanza, which
+#                       nothing here uses.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inferliq"
+version = "1.0.0"
+description = "Benchmark harness for the Liquid inference engine: lighteval's eval backend over app_main"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "lighteval>=0.13.0",
+    "langdetect>=1.0.9",
+]
+
+[project.optional-dependencies]
+# What `python3 util/make.py install` sets up for `test/test.py` and `util/tune.py`:
+# the reference implementation the engine is compared against. `util/make.py` keeps
+# its own copy of this list because it must work before anything is installed.
+reference = [
+    "torch>=2.0",
+    "transformers>=4.54.0",
+    "safetensors",
+    "numpy>=2",
+    "tokenizers",
+]
+# The LoRA tune and the abliteration pass, both of which util/tune.py reports
+# and skips when they are absent.
+tune = [
+    "peft",
+    "datasets",
+    "accelerate",
+]
+
+[tool.setuptools]
+# There is no package to install -- the repository is flat, one C engine and
+# four scripts beside it -- so this project is its dependencies and nothing
+# more. The file list is closed; see AGENTS.md.
+py-modules = []

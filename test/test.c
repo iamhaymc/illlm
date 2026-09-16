@@ -1,15 +1,15 @@
 /* ============================================================================
- * app_test.c -- unit tests for the engine internals.
+ * test/test.c -- unit tests for the engine internals.
  *
- * app_test.py proves the whole stack against transformers.  This file proves
+ * test/test.py proves the whole stack against transformers.  This file proves
  * the parts underneath it: number formats, the json reader, every compute
  * kernel against a plain-C restatement of the same maths, the thread pool, the
  * tokenizer machinery, and the sampler.
  *
- * Build and run:  python3 run.py test
+ * Build and run:  python3 util/make.py test
  * ==========================================================================*/
 
-#include "app_core.c"
+#include "../app/core.c"
 
 /* -- harness --------------------------------------------------------------- */
 
@@ -751,12 +751,12 @@ static void test_paths(void)
 {
     char out[64];
     test_open("paths");
-    ill_path_join(out, sizeof(out), "models", "config.json");
+    ill_path_join(out, sizeof(out), "ckpt", "config.json");
     test_case("join adds one separator",
-              !strcmp(out, "models/config.json") || !strcmp(out, "models\\config.json"), "%s", out);
-    ill_path_join(out, sizeof(out), "models/", "config.json");
+              !strcmp(out, "ckpt/config.json") || !strcmp(out, "ckpt\\config.json"), "%s", out);
+    ill_path_join(out, sizeof(out), "ckpt/", "config.json");
     test_case("join does not double a separator",
-              !strcmp(out, "models/config.json") || !strcmp(out, "models/config.json"), "%s", out);
+              !strcmp(out, "ckpt/config.json") || !strcmp(out, "ckpt/config.json"), "%s", out);
     ill_path_join(out, sizeof(out), "a", "b");
     test_case("join handles short names", strlen(out) == 3, "%s", out);
     test_case("suffix match is anchored at the end",

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""run.py -- the project's workflows: install, build, test, run.
+"""util/make.py -- the project's workflows: install, build, test, run.
 
-  python3 run.py install            set up the reference stack for app_test.py
-  python3 run.py build              compile app_main and app_test into build/
-  python3 run.py test               run the C unit tests and the reference suite
-  python3 run.py run -- <args>      build, then hand <args> to app_main
-  python3 run.py bench --model DIR  build, then time prefill and decode
-  python3 run.py clean              remove build/
-  python3 run.py all                install, build, test
+  python3 util/make.py install            set up the reference stack for test/test.py
+  python3 util/make.py build              compile app/main.c and test/test.c into build/
+  python3 util/make.py test               run the unit tests and the reference suite
+  python3 util/make.py run -- <args>      build, then hand <args> to app
+  python3 util/make.py bench --model DIR  build, then time prefill and decode
+  python3 util/make.py clean              remove build/
+  python3 util/make.py all                install, build, test
 
 Build flavours
   --portable      target a widely available instruction set, not this host
@@ -16,7 +16,7 @@ Build flavours
   --sanitize      address and undefined behaviour sanitizers (clang or gcc)
   --cc PATH       use a specific compiler
 
-Everything else after `--` goes straight to app_main.
+Everything else after `--` goes straight to app.
 """
 
 import argparse
@@ -26,10 +26,14 @@ import shutil
 import subprocess
 import sys
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 VENV = os.path.join(ROOT, ".venv")
 NEEDS = ["torch", "transformers", "safetensors", "numpy", "tokenizers"]
+
+# output binary names, built into build/
+APP = "app_main"
+TEST = "app_test"
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +148,8 @@ def do_build(args):
     print(f"  flavour: {'no-simd' if args.no_simd else 'portable' if args.portable else 'native'}"
           f"{', debug' if args.debug else ''}{', sanitize' if args.sanitize else ''}")
     suffix = ".exe" if os.name == "nt" else ""
-    for source, name in (("app_main.c", "app_main"), ("app_test.c", "app_test")):
+    for source, name in ((os.path.join("app", "main.c"), APP),
+                         (os.path.join("test", "test.c"), TEST)):
         code = compile_one(cc, os.path.join(ROOT, source),
                            os.path.join(BUILD, name + suffix), flags, link, msvc)
         if code != 0:
@@ -166,7 +171,7 @@ def do_install(args):
     code = call([python, "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
     code |= call([python, "-m", "pip", "install", *NEEDS])
     if code != 0:
-        print("\ninstall failed.  The reference stack is only needed by app_test.py;\n"
+        print("\ninstall failed.  The reference stack is only needed by test/test.py;\n"
               "the engine itself builds and runs with no dependencies at all.")
     _ = args
     return 0 if code == 0 else 1
@@ -177,10 +182,10 @@ def do_test(args):
     if code != 0:
         return code
     suffix = ".exe" if os.name == "nt" else ""
-    binary = os.path.join(BUILD, "app_main" + suffix)
+    binary = os.path.join(BUILD, APP + suffix)
 
     say("unit tests")
-    code = call([os.path.join(BUILD, "app_test" + suffix)])
+    code = call([os.path.join(BUILD, TEST + suffix)])
     if code != 0:
         return code
 
@@ -189,9 +194,9 @@ def do_test(args):
     probe = subprocess.call([python, "-c", "import torch, transformers"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if probe != 0:
-        print("  transformers is not installed; skipping (python3 run.py install)")
+        print("  transformers is not installed; skipping (python3 util/make.py install)")
         return 0
-    cmd = [python, os.path.join(ROOT, "app_test.py"), "--binary", binary]
+    cmd = [python, os.path.join(ROOT, "test", "test.py"), "--binary", binary]
     if args.model:
         cmd += ["--model", args.model]
     if args.no_checkpoint:
@@ -210,20 +215,20 @@ def do_run(args):
     if not rest:
         rest = ["help"]
     say("run")
-    return call([os.path.join(BUILD, "app_main" + suffix), *rest])
+    return call([os.path.join(BUILD, APP + suffix), *rest])
 
 
 def do_bench(args):
     code = do_build(args)
     if code != 0:
         return code
-    model = args.model or os.path.join(ROOT, "model")
+    model = args.model or os.path.join(ROOT, "ckpt", "0.4b")
     if not os.path.isdir(model):
         print(f"bench needs a checkpoint: {model} not found; pass --model PATH")
         return 1
     suffix = ".exe" if os.name == "nt" else ""
     say("bench")
-    return call([os.path.join(BUILD, "app_main" + suffix), "bench",
+    return call([os.path.join(BUILD, APP + suffix), "bench",
                  "--model", model, *args.rest])
 
 
@@ -265,9 +270,9 @@ def main():
     parser.add_argument("--sanitize", action="store_true", help="address and ub sanitizers")
     parser.add_argument("--model", default=None, help="checkpoint folder")
     parser.add_argument("--no-checkpoint", action="store_true",
-                        help="skip the checkpoint suite even when ./model exists")
+                        help="skip the checkpoint suite even when ./ckpt/0.4b exists")
     parser.add_argument("--filter", default=None, help="subset of reference checks to run")
-    # Everything after a literal `--` belongs to app_main, not to this script,
+    # Everything after a literal `--` belongs to app, not to this script,
     # so it is split off before argparse sees it.
     argv = sys.argv[1:]
     rest = []

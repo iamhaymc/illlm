@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""app_tune.py - tunes the checkpoint into caveman speech, and repacks it.
+"""util/tune.py - tunes the checkpoint into caveman speech, and repacks it.
 
 The engine reads the Hugging Face checkpoint directly and has no trainer of
 its own, so a tune happens on the reference side: a LoRA adapter trains over
@@ -30,24 +30,24 @@ Six steps, each needing only what the one before it produced. `--uncensor` is
 the one that is optional -- the tune runs with it or without it -- and every
 step after it reads what it wrote:
 
-    python3 app_tune.py --lint                                  audit the corpus
-    python3 app_tune.py --make-data --source raw.jsonl          grow the corpus
-    python3 app_tune.py --model model --uncensor                abliterate refusals
-    python3 app_tune.py --model model --train
-    python3 app_tune.py --model model --merge
-    python3 app_tune.py --model model --check --tuned build/tune/merged
+    python3 util/tune.py --lint                                  audit the corpus
+    python3 util/tune.py --make-data --source raw.jsonl          grow the corpus
+    python3 util/tune.py --model ckpt/0.4b --uncensor            abliterate refusals
+    python3 util/tune.py --model ckpt/0.4b --train
+    python3 util/tune.py --model ckpt/0.4b --merge
+    python3 util/tune.py --model ckpt/0.4b --check --tuned build/tune/merged
 
 They also compose, which is the point of the chaining: one command takes the
 published weights to a decensored, tuned checkpoint with nobody watching it.
 
-    python3 app_tune.py --model model --uncensor --train --merge
+    python3 util/tune.py --model ckpt/0.4b --uncensor --train --merge
 
 `--train` writes `build/tune/adapter` (the PEFT adapter) and `build/tune/`
 (its trainer state). `--merge` folds the adapter into the base weights and
-writes `build/tune/merged`, a checkpoint in the same layout as `model/` that
-the engine and the reference both read directly:
+writes `build/tune/merged`, a checkpoint in the same layout as `ckpt/0.4b`
+that the engine and the reference both read directly:
 
-    python3 run.py run -- generate --model build/tune/merged --prompt "Hello!"
+    python3 util/make.py run -- generate --model build/tune/merged --prompt "Hello!"
 
 `--check` is the number that says whether the tune worked: it runs the base
 and the tuned checkpoint over the held out rows and reports how far the
@@ -56,7 +56,7 @@ output shrank beside how much of the answer survived.
 The corpus
 ----------
 
-`datasets/data_tune.jsonl` beside this script, one JSON object per line:
+`data/tune.jsonl` beside this script, one JSON object per line:
 
     prompt      required, the user turn
     thinking    required, the reasoning that goes inside <think>...</think>
@@ -158,7 +158,7 @@ Uncensoring the weights first
 
 `--uncensor` runs heretic (<https://github.com/p-e-w/heretic>) over the
 checkpoint before anything trains and writes the decensored weights to
-`build/tune/uncensored`, in the same layout as `model/`. It is not a tune and
+`build/tune/uncensored`, in the same layout as `ckpt/0.4b`. It is not a tune and
 shares no mechanism with one: no gradient step and no corpus, but a low rank
 edit that subtracts the direction the residual stream moves in when the model
 is about to refuse. That direction is measured over 400 harmless and 400
@@ -223,13 +223,13 @@ import os
 import re
 import sys
 
-ROOT_PATH = os.path.dirname(os.path.abspath(__file__))
+ROOT_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TUNE_PATH = os.path.join(ROOT_PATH, "build", "tune")
 ADAPTER_PATH = os.path.join(TUNE_PATH, "adapter")
 MERGED_PATH = os.path.join(TUNE_PATH, "merged")
 UNCENSOR_PATH = os.path.join(TUNE_PATH, "uncensored")
 UNCENSOR_STUDY = os.path.join(TUNE_PATH, "uncensor-study")
-DATA_PATH = os.path.join(ROOT_PATH, "datasets", "data_tune.jsonl")
+DATA_PATH = os.path.join(ROOT_PATH, "data", "tune.jsonl")
 
 # A style change is a small change, and the corpus is a few hundred rows of it.
 # These defaults train it in one pass on one card; raise the epochs with the
@@ -1033,14 +1033,14 @@ def uncensor_argv(model_path, flag):
         request says -- and the divergence is measured at the first token of a
         thought. Closing the block in the prompt puts both back on the answer.
         No trailing newline: this checkpoint writes none, and greedy from
-        `model/` produces `...concisely.</think>Here are three practical tips`.
+        `ckpt/2.6b` produces `...concisely.</think>Here are three practical tips`.
       - `--kl-divergence-scale` follows `--uncensor-kl`. The scale is the
         divergence heretic treats as typical when it balances its two
         objectives against each other; leaving it at 1.0 while exporting only
         trials at or under 0.25 spends the search on a band nothing can be
         taken from.
       - `--max-shard-size 1900MB`, the same cap `--merge` writes under, so the
-        result can be committed the way `model/` is: two gigabytes is the
+        result can be committed the way `ckpt/` is: two gigabytes is the
         limit for one LFS object.
       - `--export-strategy merge`, because the engine reads a plain checkpoint
         and has no idea what a PEFT adapter is.
@@ -1447,7 +1447,7 @@ def merge_step(model_path, adapter_path, out_path):
     before it is written: the engine reads bf16 directly, and saving float32
     would double a checkpoint nobody asked to grow. Shards are capped under
     two gigabytes, which is the limit a single LFS object may have, so a
-    merged checkpoint can be committed the way `model/` is."""
+    merged checkpoint can be committed the way `ckpt/` is."""
     import torch
     from peft import PeftModel
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -1583,8 +1583,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="inferliqu caveman fine tuning",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default=os.environ.get("INFERLIQU_MODEL", "model"),
-                        help="checkpoint folder in huggingface layout")
+    parser.add_argument("--model",
+                        default=os.environ.get("INFERLIQU_MODEL",
+                            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                         "ckpt", "0.4b")),
+                        help="checkpoint folder in huggingface layout (default ckpt/0.4b)")
     parser.add_argument("--data", default=DATA_PATH,
                         help="JSONL corpus, one row per line")
     parser.add_argument("--lint", action="store_true",
@@ -1670,9 +1673,9 @@ def main():
         if not flag.source:
             print("skip: --make-data needs --source, a JSONL file or a dataset id")
             return 0
-        # Into build/, which run.py generates and git ignores: the source tree's
-        # file list is closed, and a generated corpus is not part of it. Merge
-        # what survives into datasets/data_tune.jsonl by hand, or point --data at it.
+        # Into build/, which util/make.py generates and git ignores: the source
+        # tree's file list is closed, and a generated corpus is not part of it.
+        # Merge what survives into data/tune.jsonl by hand, or point --data at it.
         out_path = flag.out or os.path.join(TUNE_PATH, "data_more.jsonl")
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         make_data(flag.source, out_path, flag.think_level, flag.reply_level,

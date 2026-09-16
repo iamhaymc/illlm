@@ -1,0 +1,12 @@
+{
+    "chat.useAgentsMdFile": true,
+    "chat.useNestedAgentsMdFiles": false,
+    "chat.useAgentSkills": true,
+    "chat.useHooks": true,
+    "chat.useClaudeMdFile": false,
+    "chat.useClaudeHooks": false,
+    "ollama.endpoint": "http://0.0.0.0:11434",
+    "files.exclude": {
+        "**/__pycache__": true
+    }
+}

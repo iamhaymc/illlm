@@ -1,19 +1,19 @@
 /* ============================================================================
- * app_main.c -- command line front end for the Liquid inference engine.
+ * app/main.c -- command line front end for the Liquid inference engine.
  *
  * Commands
  *   info      report what a checkpoint contains and how it would be loaded
  *   tokens    encode text to ids, or decode ids back to text
  *   generate  continue a prompt and stream the result
  *   chat      hold a turn by turn conversation
- *   logits    dump raw logits, the hook app_test.py compares against
+ *   logits    dump raw logits, the hook test/test.py compares against
  *   bench     measure prefill and decode throughput
  *
  * Every command takes --model PATH, the folder holding config.json, the
  * safetensors shards, and tokenizer.json.  `app_main help` lists the rest.
  * ==========================================================================*/
 
-#include "app_core.c"
+#include "core.c"
 
 /* -- shared options -------------------------------------------------------- */
 

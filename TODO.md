@@ -1,11 +1,11 @@
-# TODO
+# TODO (Open)
 
-Open development tasks, grouped by what they block. Nothing here is required
-for the engine to run correctly today.
+Open development tasks, grouped by what they block. 
+Nothing here is required for the engine to run correctly today.
 
 ## Verification
 
-- Run `run.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
+- Run `util/make.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
   weights. Partly done: `info` and `generate` run against the published
   checkpoint (2.69B, 30 layers: 8 attention + 22 convolution), prefill and
   decode both produce coherent text, and the harness compares logits against
@@ -20,7 +20,7 @@ for the engine to run correctly today.
   The checkpoint's chat_template.jinja is present; the detector matched the
   chatml flavour.
 - ~~Build and run the test suite on Windows with MSVC.~~ Done on x64: compiles
-  with MSVC 19.42 after two fixes in app_core.c -- the `near` local (a Win32
+  with MSVC 19.42 after two fixes in app/core.c -- the `near` local (a Win32
   macro) renamed, and an atomic shim (Interlocked-based) so the Win32 thread
   pool engages instead of falling back to single threaded. 73 checks pass.
   The shim is scoped to x86/x64; see the arm64 item below.
@@ -33,7 +33,7 @@ for the engine to run correctly today.
 - Add a perplexity command so accuracy loss from `--quant q8` can be reported as
   a number rather than as a correlation.
 - Run the caveman tune against the published weights. **Blocked**: the pipeline
-  in `app_tune.py` is verified end to end on a synthetic six layer Liquid
+  in `util/tune.py` is verified end to end on a synthetic six layer Liquid
   checkpoint carrying the real tokenizer and chat template -- the loss mask
   covers the assistant span and nothing before it, the adapter reaches 34 of
   the 35 linear layers, the merge preserves the checkpoint's own dtype, the
@@ -41,7 +41,7 @@ for the engine to run correctly today.
   but no tune has been taken over the 2.6B weights, so there is no number for
   what the register costs in accuracy. It needs a card, not a change.
 - Run the abliteration against the published weights. **Blocked**: the drive in
-  `app_tune.py` is verified end to end on a synthetic four layer Liquid
+  `util/tune.py` is verified end to end on a synthetic four layer Liquid
   checkpoint carrying the real tokenizer and chat template over the real 128000
   entry vocabulary -- heretic reaches eight modules over the four blocks, the
   settings arrive as heretic parses them, a two trial search exports the trial
@@ -56,7 +56,7 @@ for the engine to run correctly today.
   and what it cost: refusals on the held out harmful prompts beside the base's,
   and a `--check` afterwards to say whether the register and the answers
   survived the edit. It needs a card, not a change.
-- Grow `datasets/data_tune.jsonl` past its 202 hand written rows with `--make-data`
+- Grow `data/tune.jsonl` past its 202 hand written rows with `--make-data`
   against a published reasoning corpus. The press is deletion only and takes
   about 29% off the prose it is given, which is the floor rather than the
   ceiling: a hand written caveman answer restructures and reaches 2.4x. The

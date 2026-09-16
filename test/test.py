@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""app_test.py -- compares the C engine against the reference implementation.
+"""test/test.py -- compares the C engine against the reference implementation.
 
 The engine claims to run the Liquid architecture exactly as Hugging Face
 transformers runs it.  This script is where that claim is checked.
@@ -12,20 +12,21 @@ Two modes:
               No download is needed, so it runs anywhere transformers does.
 
   checkpoint  `--model PATH` points at a real checkpoint.  The default is the
-              `model/` folder at the repo root, which carries the published
-              LFM2.5-2.6B weights.  Against it the suite adds a tokenizer
-              agreement check, a throughput comparison -- the engine's `bench`
-              beside transformers doing the same shape of work at the same
-              weight width -- and a greedy continuation compared on the text,
-              judged against how far the reference parts from itself.
+               `ckpt/0.4b` folder at the repo root, which carries the published
+              LFM2.5-350M weights; `ckpt/1.2b` and `ckpt/2.6b` hold the larger
+              checkpoints.  Against it the suite adds a tokenizer agreement
+              check, a throughput comparison -- the engine's `bench` beside
+              transformers doing the same shape of work at the same weight
+              width -- and a greedy continuation compared on the text, judged
+              against how far the reference parts from itself.
 
               A missing checkpoint folder is a skip, not a failure: the
               synthetic suite is the parity argument and runs without it.
 
 usage
-  python3 app_test.py --binary ./build/app_main
-  python3 app_test.py --binary ./build/app_main --model ~/models/LFM2.5-2.6B
-  python3 app_test.py --filter conv          # run a subset by name
+  python3 test/test.py --binary ./build/app_main
+  python3 test/test.py --binary ./build/app_main --model ckpt/2.6b
+  python3 test/test.py --filter conv          # run a subset by name
 """
 
 import argparse
@@ -38,10 +39,12 @@ import sys
 import tempfile
 import time
 
-# The published checkpoint ships in the repository, so the checkpoint suite
-# runs by default; pass --model to point somewhere else, or --no-checkpoint to
-# skip it entirely.
-DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+# The published checkpoints ship in the repository under ckpt/, so the
+# checkpoint suite runs by default; pass --model to point somewhere else, or
+# --no-checkpoint to skip it entirely.  The default is the smallest checkpoint,
+# ckpt/0.4b (LFM2.5-350M); ckpt/1.2b and ckpt/2.6b hold the larger ones.
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "ckpt", "0.4b")
 
 # ---------------------------------------------------------------------------
 # harness
@@ -699,9 +702,9 @@ def main():
     parser.add_argument("--binary", default="./build/app_main",
                         help="path to the compiled CLI (default ./build/app_main)")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="checkpoint folder to test against (default ./model)")
+                        help="checkpoint folder to test against (default ./ckpt/0.4b)")
     parser.add_argument("--no-checkpoint", action="store_true",
-                        help="skip the checkpoint suite even when ./model exists")
+                        help="skip the checkpoint suite even when ./ckpt/0.4b exists")
     parser.add_argument("--filter", default=None, help="only run checks whose name contains this")
     parser.add_argument("--keep", action="store_true", help="keep the synthetic checkpoints")
     args = parser.parse_args()
@@ -717,12 +720,12 @@ def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     if not os.path.exists(args.binary):
-        print(f"binary not found: {args.binary}\nbuild it first: python3 run.py build")
+        print(f"binary not found: {args.binary}\nbuild it first: python3 util/make.py build")
         return 2
     try:
         import torch, transformers            # noqa: F401
     except ImportError as why:
-        print(f"reference stack missing: {why}\ninstall it: python3 run.py install")
+        print(f"reference stack missing: {why}\ninstall it: python3 util/make.py install")
         return 2
 
     import logging
