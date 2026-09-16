@@ -9,7 +9,7 @@
 
 A fast and tiny engine for agents.
 
-It implements methodology related to
+It offers utilities related to:
 inference, encoding, extraction, vision, speech
 
 It supports Huggingface checkpoints for:
