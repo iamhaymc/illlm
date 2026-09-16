@@ -10,8 +10,8 @@
 A fast and tiny engine for agents.
 
 It offers utilities related to:
-- inference & basic tools
-- text encoding & extraction, 
+- inference & tools
+- encoding & extraction
 - vision & imaging
 - speech & transcription
 
