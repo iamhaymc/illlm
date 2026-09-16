@@ -2011,6 +2011,22 @@ static void ill_soft_max(float *cells, int32_t width)
     for (j = 0; j < width; ++j) cells[j] *= back;
 }
 
+/* log(sum(exp(row))), the normaliser a row's log probabilities are measured
+ * against.  Taken relative to the row's peak, which is the only way to write
+ * it that does not overflow on logits of this size, and summed in double
+ * because a score adds one of these per token over a whole text and f32 loses
+ * the tail of that sum.  `ill_soft_max` answers a different question -- it
+ * wants the probabilities themselves and may destroy the row to get them. */
+static double ill_row_logsum(const float *row, int32_t width)
+{
+    double  mass = 0.0;
+    float   peak = -FLT_MAX;
+    int32_t j;
+    for (j = 0; j < width; ++j) if (row[j] > peak) peak = row[j];
+    for (j = 0; j < width; ++j) mass += exp((double)(row[j] - peak));
+    return (double)peak + log(mass);
+}
+
 /* dst += weight * src, the attention value mix and the conv tap. */
 static void ill_axpy_add(float *dst, const float *src, float weight, int32_t width)
 {

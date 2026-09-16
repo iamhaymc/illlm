@@ -32,6 +32,20 @@ the kernel and the rest has to come from somewhere else.
 Prefill is arithmetic bound instead, and has further to go: 32.6 tok/s on the
 same host is 88 G multiply-adds a second.
 
+### What q8 costs
+
+Measured by `perplexity` (1.3.0) on the published 2.6B checkpoint, over two
+unlike texts — technical prose and licence boilerplate:
+
+| | bf16, as stored | q8, repacked |
+| --- | --- | --- |
+| `GUIDE.md` prose, 2056 tokens | 3.6080 nats — 36.892 | 3.5999 nats — 36.594 |
+| Apache licence, 1900 tokens | 0.6798 nats — 1.9734 | 0.6756 nats — 1.9651 |
+
+**The cost is below what the measurement can see** — under a quarter of a
+percent on both, and falling the wrong way for a lossy format. The sign is not
+a result; the size is. Anything narrower than q8 is judged against this row.
+
 ### The refusal register
 
 Ideas that were tried, measured, and are not worth having. They are here so
@@ -455,3 +469,85 @@ paired dot checks and eight of the q8 dense sweep, 10 in all.
 
 The suite passes on the native, portable, no-simd and AVX2-only builds.
 **86 pass**, 73 before.
+
+---
+
+## 1.3.0 — a number for what q8 costs
+
+`--quant q8` halves the weights and there was no way to say what it took in
+accuracy. What the project had was a correlation against `transformers` —
+top-1 agreement 100%, correlation 0.9999 — which says the two engines agree
+with each other and not what either is worth. Every open item that trades
+accuracy for speed, q4 and a narrower key/value cache first among them, was
+therefore unlandable on evidence: there was nothing to move in a known
+direction.
+
+### What it took
+
+- **A `perplexity` command.** It reads a text from stdin or `--prompt`, runs
+  one left to right pass, and reports the mean negative log likelihood the
+  model gives each token in nats, in bits, and as its exponent. Every token but
+  the first is scored, against the whole text before it rather than a window,
+  so a token late in the text is judged on everything the model has seen. The
+  pass is cut into `--batch` chunks only because asking for a row per token
+  over a long text at once would allocate the vocabulary once per token —
+  128000 floats a row is 131 MB at a chunk of 256, and a thousand rows would be
+  half a gigabyte.
+
+  The text is scored as it stands, with no chat template wrapped around it even
+  without `--raw`. Shaping a turn around it would score the template's own
+  tokens, which is not what the number is for.
+
+- **`ill_row_logsum` in the engine**, beside `ill_soft_max` rather than in the
+  command line. It is the normaliser a row's log probabilities are measured
+  against, taken relative to the row's peak because `exp` of a logit of this
+  size is infinity, and summed in double because a score adds one of these per
+  token over a whole text. `ill_soft_max` answers a different question — it
+  wants the probabilities and may destroy the row to get them — so the two sit
+  side by side rather than one calling the other.
+
+### What it is worth
+
+The published 2.6B checkpoint on `xeon-2.8`, over two texts that are nothing
+like each other: about 2050 tokens of this repository's own `GUIDE.md`, which
+is technical prose with tables in it, and about 1900 tokens of the Apache
+licence, which is boilerplate a model has seen many times.
+
+| | GUIDE.md prose | licence boilerplate |
+| --- | --- | --- |
+| bf16, as stored | 3.6080 nats — **36.892** | 0.6798 nats — **1.9734** |
+| q8, repacked | 3.5999 nats — **36.594** | 0.6756 nats — **1.9651** |
+
+**The cost of q8 is not distinguishable from zero on either text.** The gap is
+0.008 nats a token on the first and 0.004 on the second, both under a quarter
+of a percent, and on both it falls the wrong way for a lossy format: q8 scores
+marginally better than the weights it was made from.
+
+Do not read the sign. Two texts is not a corpus and a quarter of a percent is
+not a direction; what the pair of numbers supports is the claim that the
+format's cost is below what this measurement can see, which is the claim that
+was wanted. A block of 32 values sharing one f32 scale can resolve more finely
+than bf16's eight bits of significand where the block's values are of similar
+size, which is a reason the sign could be real, and is not evidence that it is.
+
+The number these were taken to enable is q4's. This is the instrument, not the
+result.
+
+### Code
+
+`app/main.c` gains `app_do_perplexity` and `app_slurp`, and `perplexity` joins
+the verb table and the help. `app/core.c` gains `ill_row_logsum` in part 8,
+beside the elementwise stages.
+
+### Tests
+
+Three checks on the normaliser, in a new `scoring` area. A flat row of n equal
+values normalises to `v + log(n)`, which is the one case whose answer can be
+written down; the same row therefore gives every token exactly `-log(n)`, which
+is the identity the scoring loop rests on; and a row holding 800.0 still
+normalises, where `exp(800)` is infinity in double.
+
+They bite: dropping the subtraction of the row's peak leaves the third
+reporting `inf`.
+
+**89 pass**, 86 before.

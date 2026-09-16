@@ -8,6 +8,7 @@
  *   chat      hold a turn by turn conversation
  *   logits    dump raw logits, the hook test/test.py compares against
  *   bench     measure prefill and decode throughput
+ *   perplexity  score a text, so an accuracy trade has a number
  *
  * Every command takes --model PATH, the folder holding config.json, the
  * safetensors shards, and tokenizer.json.  `app_main help` lists the rest.
@@ -64,6 +65,7 @@ static void app_help(void)
 "  chat                  interactive conversation on stdin\n"
 "  logits                write logits for --prompt or --tokens\n"
 "  bench                 time prefill and decode\n"
+"  perplexity            score stdin or --prompt, in nats and perplexity\n"
 "  help                  this page\n"
 "\n"
 "model options\n"
@@ -582,6 +584,129 @@ done:
     return exit_code;
 }
 
+/* -- perplexity ------------------------------------------------------------
+ *
+ * How surprised the model is by a text it did not write, in one number.  The
+ * engine had no such number: `--quant q8` was reported as a correlation
+ * against the reference, which says the two agree with each other and not what
+ * either is worth, so nothing that trades accuracy for speed could be landed
+ * on evidence.
+ *
+ * The score is the mean negative log likelihood the model assigns to each
+ * token given everything before it, and perplexity is its exponent.  Every
+ * token but the first is scored, in one left to right pass, so the context a
+ * token is judged on is the whole text up to it rather than a window.  The
+ * pass is cut into chunks only because asking for every row of a long text at
+ * once would allocate the vocabulary once per token.
+ * ------------------------------------------------------------------------*/
+
+/* Reads all of a stream into one heap block.  Returns NULL on failure. */
+static char *app_slurp(FILE *source)
+{
+    size_t room = 65536, fill = 0;
+    char  *text = (char *)ill_block_make(room);
+    if (!text) return NULL;
+    for (;;) {
+        size_t got = fread(text + fill, 1, room - fill - 1, source);
+        fill += got;
+        if (fill + 1 < room) break;
+        {
+            char *grown = (char *)ill_block_make(room * 2);
+            if (!grown) { ill_block_free(text); return NULL; }
+            memcpy(grown, text, fill);
+            ill_block_free(text);
+            text = grown;
+            room *= 2;
+        }
+    }
+    text[fill] = '\0';
+    return text;
+}
+
+static int app_do_perplexity(const AppOpts *opts)
+{
+    IllModel *model = NULL;
+    IllState *state = NULL;
+    char     *body  = NULL;
+    AppFeed   feed;
+    IllResult code  = app_model_open(opts, &model);
+    int32_t   vocab_size, chunk, done, scored = 0;
+    double    total = 0.0;
+    int       exit_code = 1;
+
+    if (code != ILL_OK) { fprintf(stderr, "load failed: %s\n", ill_result_text(code)); return 1; }
+    memset(&feed, 0, sizeof(feed));
+    vocab_size = ill_model_arch(model)->vocab_size;
+
+    /* The text is scored as it stands.  Wrapping it in the chat template would
+     * score the template's own tokens as well, which is not what the number is
+     * for, so `perplexity` does not shape a prompt even without `--raw`. */
+    if (opts->token_text) {
+        if (!app_feed_ids(&feed, opts->token_text)) { code = ILL_ALLOC; goto done; }
+    } else {
+        const IllVocab *vocab = ill_model_vocab(model);
+        if (!vocab) {
+            fprintf(stderr, "this checkpoint has no readable tokenizer; use --tokens\n");
+            goto done;
+        }
+        body = opts->prompt_text ? NULL : app_slurp(stdin);
+        if (!opts->prompt_text && !body) { code = ILL_ALLOC; goto done; }
+        code = app_feed_text(&feed, vocab, opts->prompt_text ? opts->prompt_text : body, 1);
+        if (code != ILL_OK) { fprintf(stderr, "encode failed: %s\n", ill_result_text(code)); goto done; }
+    }
+
+    if (feed.count < 2) {
+        fprintf(stderr, "perplexity needs at least two tokens, got %d\n", feed.count);
+        goto done;
+    }
+    if (feed.count > opts->context_span) {
+        fprintf(stderr, "text is %d tokens and the window is %d; raise --ctx\n",
+                feed.count, opts->context_span);
+        goto done;
+    }
+
+    code = ill_state_make(&state, model, opts->context_span);
+    if (code != ILL_OK) { fprintf(stderr, "state failed: %s\n", ill_result_text(code)); goto done; }
+
+    chunk = opts->batch_span > 0 ? opts->batch_span : 256;
+    for (done = 0; done < feed.count; ) {
+        int32_t span = ILL_MIN(chunk, feed.count - done);
+        float  *rows = NULL;
+        IllBatch batch;
+        int32_t at;
+        batch.tokens = feed.tokens + done;
+        batch.count  = span;
+        batch.every  = 1;
+        code = ill_model_apply(model, state, &batch, &rows);
+        if (code != ILL_OK) { fprintf(stderr, "apply failed: %s\n", ill_result_text(code)); goto done; }
+        /* Row `at` predicts the token after it, so the last token of the text
+         * has no row to be scored against and the last row of a chunk is
+         * scored against the first token of the next one. */
+        for (at = 0; at < span; ++at) {
+            const float *row = rows + (size_t)at * vocab_size;
+            int32_t next = done + at + 1;
+            if (next >= feed.count) break;
+            total += ill_row_logsum(row, vocab_size) - (double)row[feed.tokens[next]];
+            ++scored;
+        }
+        done += span;
+    }
+
+    printf("tokens    %d scored of %d\n", scored, feed.count);
+    printf("weights   %s\n", opts->weight_type == ILL_TYPE_Q8 ? "q8" : "as stored");
+    printf("nll       %.4f nats a token\n", total / (double)scored);
+    printf("bits      %.4f a token\n", total / (double)scored / log(2.0));
+    printf("perplexity %.4f\n", exp(total / (double)scored));
+    exit_code = 0;
+
+done:
+    ill_block_free(body);
+    app_feed_free(&feed);
+    ill_state_free(state);
+    ill_model_free(model);
+    return exit_code;
+}
+
 static int app_do_bench(const AppOpts *opts)
 {
     IllModel *model = NULL;
@@ -665,6 +790,7 @@ int main(int argc, char **argv)
     if (!strcmp(verb, "chat"))     return app_do_chat(&opts);
     if (!strcmp(verb, "logits"))   return app_do_logits(&opts);
     if (!strcmp(verb, "bench"))    return app_do_bench(&opts);
+    if (!strcmp(verb, "perplexity")) return app_do_perplexity(&opts);
 
     fprintf(stderr, "unknown command: %s\n", verb);
     app_help();

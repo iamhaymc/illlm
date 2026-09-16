@@ -24,6 +24,7 @@ Add `--quant q8` to halve the memory and roughly double decode speed. Add
 ```sh
 python3 util/make.py test                              # unit tests plus reference comparison
 python3 util/make.py bench --model path/to/LFM2.5-2.6B # prefill and decode throughput
+./build/app_main perplexity --model path/to/LFM2.5-2.6B --quant q8 < some.txt
 python3 util/make.py run -- generate --model DIR --prompt "hello"
 ```
 

@@ -684,6 +684,36 @@ static void test_sampler(void)
     float logits[64], work[64];
     int32_t index;
 
+    test_open("scoring");
+    {   /* A flat row of n equal values normalises to v + log(n), which is the
+           one case the answer can be written down.  A score is a sum of these
+           over a whole text, so being a little wrong here is being wrong once
+           a token. */
+        float flat[64];
+        double got, want;
+        int32_t k;
+        for (k = 0; k < 64; ++k) flat[k] = 2.5f;
+        got = ill_row_logsum(flat, 64);
+        want = 2.5 + log(64.0);
+        test_case("a flat row normalises to its value plus log of its width",
+                  fabs(got - want) < 1e-9, "%.9f vs %.9f", got, want);
+
+        /* Uniform rows give every token the same log probability, -log(n),
+           whatever the value they are flat at.  That is the sanity check the
+           scoring loop rests on: normaliser minus the chosen logit. */
+        test_case("a flat row gives every token -log(width)",
+                  fabs((flat[7] - got) + log(64.0)) < 1e-9, "%.9f",
+                  (double)flat[7] - got + log(64.0));
+
+        /* exp(800) is infinity in double.  Measuring against the peak is what
+           keeps a confident row from scoring as a NaN. */
+        for (k = 0; k < 64; ++k) flat[k] = -800.0f;
+        flat[13] = 800.0f;
+        got = ill_row_logsum(flat, 64);
+        test_case("a row far outside exp's range still normalises",
+                  got > 799.0 && got < 801.0, "%.6f", got);
+    }
+
     test_open("sampler");
     for (index = 0; index < vocab; ++index) logits[index] = (float)index * 0.1f;
     logits[40] = 100.0f;

@@ -437,6 +437,7 @@ app_main generate  continue a prompt and stream the completion
 app_main chat      interactive conversation on stdin
 app_main logits    write logits, the hook test/test.py compares against
 app_main bench     time prefill and decode
+app_main perplexity  score a text, so an accuracy trade has a number
 ```
 
 `app_main help` lists every flag. Three are worth knowing:
@@ -449,6 +450,14 @@ app_main bench     time prefill and decode
 `logits` also takes `--every` for a row per token and `--stream --prefill N` to
 feed the first `N` tokens as one batch and the rest one at a time. That second
 mode exists so the test suite can check the caches rather than only the maths.
+
+`perplexity` reads a text from stdin or `--prompt` and reports the mean
+negative log likelihood it assigns to each token given everything before it,
+in nats, in bits, and as its exponent. It scores the text as it stands — no
+chat template is wrapped around it even without `--raw`, because the template's
+own tokens are not what the number is for. It exists so that a change which
+trades accuracy for speed can be judged rather than argued about; the cost of
+`--quant q8` is the first thing it was pointed at.
 
 ---
 
