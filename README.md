@@ -13,9 +13,9 @@ It offers utilities related to:
 inference, encoding, extraction, vision, speech
 
 It supports Huggingface checkpoints for:
-- LFM2.5 model architecture
-- Gemma4 model architecture
-- YOLO26 model architecture
+- LFM2.5 multi-modal architecture
+- Gemma4 multi-modal architecture
+- YOLO26 vision architecture
 
 It is written in pure and optimized C11,
 cross-platform, and designed for acceleration.
