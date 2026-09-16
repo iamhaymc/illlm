@@ -9,12 +9,8 @@
 
 A fast and tiny engine for agents.
 
-It offers utilities related to:
-- inference
-- vision IO
-- speech IO
-- encoding
-- extraction
+It offers a variety of utilities
+including inference, vision, and speech.
 
 It is written in pure and optimized C11,
 cross-platform, and designed for acceleration.
