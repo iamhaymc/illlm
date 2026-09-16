@@ -32,19 +32,19 @@ step after it reads what it wrote:
 
     python3 util/tune.py --lint                                  audit the corpus
     python3 util/tune.py --make-data --source raw.jsonl          grow the corpus
-    python3 util/tune.py --model ckpt/0.4b --uncensor            abliterate refusals
-    python3 util/tune.py --model ckpt/0.4b --train
-    python3 util/tune.py --model ckpt/0.4b --merge
-    python3 util/tune.py --model ckpt/0.4b --check --tuned build/tune/merged
+    python3 util/tune.py --model ckpt/lfm2.5-0.4b --uncensor            abliterate refusals
+    python3 util/tune.py --model ckpt/lfm2.5-0.4b --train
+    python3 util/tune.py --model ckpt/lfm2.5-0.4b --merge
+    python3 util/tune.py --model ckpt/lfm2.5-0.4b --check --tuned build/tune/merged
 
 They also compose, which is the point of the chaining: one command takes the
 published weights to a decensored, tuned checkpoint with nobody watching it.
 
-    python3 util/tune.py --model ckpt/0.4b --uncensor --train --merge
+    python3 util/tune.py --model ckpt/lfm2.5-0.4b --uncensor --train --merge
 
 `--train` writes `build/tune/adapter` (the PEFT adapter) and `build/tune/`
 (its trainer state). `--merge` folds the adapter into the base weights and
-writes `build/tune/merged`, a checkpoint in the same layout as `ckpt/0.4b`
+writes `build/tune/merged`, a checkpoint in the same layout as `ckpt/lfm2.5-0.4b`
 that the engine and the reference both read directly:
 
     python3 util/make.py run -- generate --model build/tune/merged --prompt "Hello!"
@@ -158,7 +158,7 @@ Uncensoring the weights first
 
 `--uncensor` runs heretic (<https://github.com/p-e-w/heretic>) over the
 checkpoint before anything trains and writes the decensored weights to
-`build/tune/uncensored`, in the same layout as `ckpt/0.4b`. It is not a tune and
+`build/tune/uncensored`, in the same layout as `ckpt/lfm2.5-0.4b`. It is not a tune and
 shares no mechanism with one: no gradient step and no corpus, but a low rank
 edit that subtracts the direction the residual stream moves in when the model
 is about to refuse. That direction is measured over 400 harmless and 400
@@ -1033,7 +1033,7 @@ def uncensor_argv(model_path, flag):
         request says -- and the divergence is measured at the first token of a
         thought. Closing the block in the prompt puts both back on the answer.
         No trailing newline: this checkpoint writes none, and greedy from
-        `ckpt/2.6b` produces `...concisely.</think>Here are three practical tips`.
+        `ckpt/lfm2.5-2.6b` produces `...concisely.</think>Here are three practical tips`.
       - `--kl-divergence-scale` follows `--uncensor-kl`. The scale is the
         divergence heretic treats as typical when it balances its two
         objectives against each other; leaving it at 1.0 while exporting only
@@ -1587,7 +1587,7 @@ def main():
                         default=os.environ.get("INFERLIQU_MODEL",
                             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                          "ckpt", "0.4b")),
-                        help="checkpoint folder in huggingface layout (default ckpt/0.4b)")
+                        help="checkpoint folder in huggingface layout (default ckpt/lfm2.5-0.4b)")
     parser.add_argument("--data", default=DATA_PATH,
                         help="JSONL corpus, one row per line")
     parser.add_argument("--lint", action="store_true",

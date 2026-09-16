@@ -15,15 +15,15 @@ The flat file list became directories: the engine and its command line moved to
 `app/core.c` and `app/main.c`, the two test suites to `test/test.c` and
 `test/test.py`, and the Python workflows to `util/make.py` (was `run.py`) and
 `util/tune.py` (was `app_tune.py`). The tuning corpus moved to
-`data/tune.jsonl` and the published checkpoints to `ckpt/0.4b`, `ckpt/1.2b` and
-`ckpt/2.6b`. The engine sources are renamed, not split: `app/main.c` and
+`data/tune.jsonl` and the published checkpoints to `ckpt/lfm2.5-0.4b`, `ckpt/lfm2.5-1.2b-i` and
+`ckpt/lfm2.5-2.6b`. The engine sources are renamed, not split: `app/main.c` and
 `test/test.c` still include the engine whole, so each front end remains one
 translation unit. The binaries keep their names — `build/app_main`,
 `build/app_test` — and the workflows keep their verbs, so the command line is
 `python3 util/make.py build` where `python3 run.py build` used to be.
 
 No engine change: the same 73 unit checks pass, and the info, generate and
-bench paths resolve against `ckpt/0.4b` as they did against `models/0.4b`.
+bench paths resolve against `ckpt/lfm2.5-0.4b` as they did against `models/lfm2.5-0.4b`.
 
 ### Engine
 

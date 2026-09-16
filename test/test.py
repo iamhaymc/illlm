@@ -12,8 +12,8 @@ Two modes:
               No download is needed, so it runs anywhere transformers does.
 
   checkpoint  `--model PATH` points at a real checkpoint.  The default is the
-               `ckpt/0.4b` folder at the repo root, which carries the published
-              LFM2.5-350M weights; `ckpt/1.2b` and `ckpt/2.6b` hold the larger
+               `ckpt/lfm2.5-0.4b` folder at the repo root, which carries the published
+              LFM2.5-350M weights; `ckpt/lfm2.5-1.2b-i` and `ckpt/lfm2.5-2.6b` hold the larger
               checkpoints.  Against it the suite adds a tokenizer agreement
               check, a throughput comparison -- the engine's `bench` beside
               transformers doing the same shape of work at the same weight
@@ -25,7 +25,7 @@ Two modes:
 
 usage
   python3 test/test.py --binary ./build/app_main
-  python3 test/test.py --binary ./build/app_main --model ckpt/2.6b
+  python3 test/test.py --binary ./build/app_main --model ckpt/lfm2.5-2.6b
   python3 test/test.py --filter conv          # run a subset by name
 """
 
@@ -42,7 +42,7 @@ import time
 # The published checkpoints ship in the repository under ckpt/, so the
 # checkpoint suite runs by default; pass --model to point somewhere else, or
 # --no-checkpoint to skip it entirely.  The default is the smallest checkpoint,
-# ckpt/0.4b (LFM2.5-350M); ckpt/1.2b and ckpt/2.6b hold the larger ones.
+# ckpt/lfm2.5-0.4b (LFM2.5-350M); ckpt/lfm2.5-1.2b-i and ckpt/lfm2.5-2.6b hold the larger ones.
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "ckpt", "0.4b")
 
@@ -702,9 +702,9 @@ def main():
     parser.add_argument("--binary", default="./build/app_main",
                         help="path to the compiled CLI (default ./build/app_main)")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="checkpoint folder to test against (default ./ckpt/0.4b)")
+                        help="checkpoint folder to test against (default ./ckpt/lfm2.5-0.4b)")
     parser.add_argument("--no-checkpoint", action="store_true",
-                        help="skip the checkpoint suite even when ./ckpt/0.4b exists")
+                        help="skip the checkpoint suite even when ./ckpt/lfm2.5-0.4b exists")
     parser.add_argument("--filter", default=None, help="only run checks whose name contains this")
     parser.add_argument("--keep", action="store_true", help="keep the synthetic checkpoints")
     args = parser.parse_args()
