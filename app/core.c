@@ -3456,6 +3456,32 @@ static int32_t ill_utf8_read(const char *text, int32_t len, int32_t pos, uint32_
     return 1;
 }
 
+/* How many bytes at the end of `text` are the start of a sequence that has not
+ * finished yet.  Zero when the buffer ends cleanly, which includes the case
+ * where it ends in something that is not valid UTF-8 at all -- a caller
+ * holding bytes back wants to release rubbish rather than wait forever for a
+ * continuation that is never coming.
+ *
+ * This exists for streaming output.  A token's bytes can stop in the middle of
+ * a character, and a terminal shown those bytes draws a replacement character
+ * that the next token then corrects, so every multi-byte language flickers. */
+static int32_t ill_utf8_hold(const char *text, int32_t len)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    int32_t at = len - 1, need;
+    if (len <= 0) return 0;
+    /* Walk back over continuation bytes.  A sequence is at most four bytes, so
+     * three continuations is as far as a lead byte can be. */
+    while (at >= 0 && (p[at] & 0xC0) == 0x80 && len - at <= 3) --at;
+    if (at < 0) return 0;                    /* continuations all the way down */
+    if (p[at] < 0x80) return 0;              /* plain ascii, nothing pending   */
+    if      ((p[at] & 0xE0) == 0xC0) need = 2;
+    else if ((p[at] & 0xF0) == 0xE0) need = 3;
+    else if ((p[at] & 0xF8) == 0xF0) need = 4;
+    else return 0;                           /* not a lead byte at all        */
+    return len - at < need ? len - at : 0;
+}
+
 static int32_t ill_utf8_write(uint32_t rune, char *out)
 {
     if (rune < 0x80u) { out[0] = (char)rune; return 1; }

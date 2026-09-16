@@ -99,7 +99,7 @@ and biased convolution kernels; f32, f16, and bf16 storage; chunked prefill and
 single token decode; and tokenizer agreement over a corpus of awkward strings.
 
 Against float32 checkpoints the engine matches the reference to **2e-7
-relative**, which is float32 rounding. `test/test.c` adds 86 unit checks over the
+relative**, which is float32 rounding. `test/test.c` adds 100 unit checks over the
 internals. Both suites run clean under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 ### Comparison

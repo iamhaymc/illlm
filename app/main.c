@@ -248,15 +248,50 @@ static IllResult app_feed_make(AppFeed *feed, const AppOpts *opts, const IllMode
     }
 }
 
-/* -- streaming ------------------------------------------------------------- */
+/* -- streaming -------------------------------------------------------------
+ *
+ * A token's bytes can stop in the middle of a character.  Written straight
+ * out, the terminal draws a replacement character and the next token corrects
+ * it, so text in any multi-byte language flickers as it streams.  `AppTail`
+ * holds the unfinished bytes back until the token that completes them arrives.
+ *
+ * It is a tail, not a buffer: everything that is whole goes out at once, and
+ * at most three bytes are ever held.  If those three are never completed --
+ * because the model emitted a byte that is not valid UTF-8, which a byte level
+ * tokenizer is entitled to do -- `app_tail_flush` releases them as they are.
+ * Nothing is dropped and nothing waits for a continuation that is not coming.
+ * ------------------------------------------------------------------------*/
 
-static void app_piece_show(const IllVocab *vocab, int32_t token)
+typedef struct AppTail {
+    char    hold[4];   /* bytes of a sequence still waiting to be finished    */
+    int32_t held;
+} AppTail;
+
+static void app_tail_open(AppTail *tail) { tail->held = 0; }
+
+static void app_tail_show(AppTail *tail, const IllVocab *vocab, int32_t token)
 {
-    char    text[512];
-    int32_t span = 0;
-    if (ill_vocab_decode(vocab, token, text, (int32_t)sizeof(text), &span) != ILL_OK) return;
-    fwrite(text, 1, (size_t)span, stdout);
-    fflush(stdout);
+    char    text[512 + 4];
+    int32_t span = 0, whole;
+    if (ill_vocab_decode(vocab, token, text + tail->held,
+                         (int32_t)sizeof(text) - tail->held, &span) != ILL_OK) return;
+    if (tail->held) {
+        memcpy(text, tail->hold, (size_t)tail->held);
+        span += tail->held;
+        tail->held = 0;
+    }
+    whole = span - ill_utf8_hold(text, span);
+    if (whole > 0) { fwrite(text, 1, (size_t)whole, stdout); fflush(stdout); }
+    tail->held = span - whole;
+    if (tail->held) memcpy(tail->hold, text + whole, (size_t)tail->held);
+}
+
+/* Releases whatever is still held, valid or not.  Called when a reply ends,
+ * so a run never swallows its own last bytes. */
+static void app_tail_flush(AppTail *tail)
+{
+    if (tail->held) { fwrite(tail->hold, 1, (size_t)tail->held, stdout); fflush(stdout); }
+    tail->held = 0;
 }
 
 typedef struct AppRun {
@@ -271,12 +306,14 @@ static IllResult app_run_loop(IllModel *model, IllState *state, IllSampler *samp
                               AppRun *run)
 {
     const IllVocab *vocab = ill_model_vocab(model);
+    AppTail   tail;
     IllBatch  batch;
     float    *logits = NULL;
     IllResult code;
     double    mark;
     int32_t   step, next;
 
+    app_tail_open(&tail);
     memset(run, 0, sizeof(*run));
     run->read = feed->count;
 
@@ -295,14 +332,15 @@ static IllResult app_run_loop(IllModel *model, IllState *state, IllSampler *samp
         if (vocab && ill_vocab_stop(vocab, next)) break;
         ill_sampler_note(sampler, next);
         ++run->made;
-        if (show && vocab) app_piece_show(vocab, next);
+        if (show && vocab) app_tail_show(&tail, vocab, next);
         if (ill_state_fill(state) >= ill_state_span(state)) break;
         batch.tokens = &next;
         batch.count  = 1;
         code = ill_model_apply(model, state, &batch, &logits);
-        if (code != ILL_OK) return code;
+        if (code != ILL_OK) { if (show && vocab) app_tail_flush(&tail); return code; }
     }
     run->step_secs = ill_clock_now() - mark;
+    if (show && vocab) app_tail_flush(&tail);
     return ILL_OK;
 }
 
@@ -376,7 +414,11 @@ static int app_do_tokens(const AppOpts *opts)
 
     if (opts->token_text) {
         if (!app_feed_ids(&feed, opts->token_text)) { ill_model_free(model); return 1; }
-        for (index = 0; index < feed.count; ++index) app_piece_show(vocab, feed.tokens[index]);
+        AppTail tail;
+        app_tail_open(&tail);
+        for (index = 0; index < feed.count; ++index)
+            app_tail_show(&tail, vocab, feed.tokens[index]);
+        app_tail_flush(&tail);
         putchar('\n');
         app_feed_free(&feed);
         ill_model_free(model);

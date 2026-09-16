@@ -46,6 +46,21 @@ unlike texts — technical prose and licence boilerplate:
 percent on both, and falling the wrong way for a lossy format. The sign is not
 a result; the size is. Anything narrower than q8 is judged against this row.
 
+### The published checkpoint
+
+`python3 util/make.py test --model ckpt/2.6b` runs the whole harness against the
+real `LiquidAI/LFM2.5-2.6B` weights, not a synthetic stand-in. On `xeon-2.8`
+against `transformers` 5.17.0 and `torch` 2.14.0, quiet machine, **23 of 23
+pass**:
+
+- **logits** — max relative error 7.15e-06, top-1 agreement 100%.
+- **greedy** — the engine follows the reference for 155 characters, where the
+  reference primed a token at a time follows its own one-batch self for 0.
+- **throughput**, both sides at bf16 on the same threads — engine prefill
+  18.0 tok/s against the reference's 7.9, decode 5.1 against 3.5.
+- **thread agreement** — 1 worker against 4, max relative error 0.00e+00. The
+  engine's output does not depend on how many threads produced it.
+
 ### The refusal register
 
 Ideas that were tried, measured, and are not worth having. They are here so
@@ -551,3 +566,72 @@ They bite: dropping the subtraction of the row's peak leaves the third
 reporting `inf`.
 
 **89 pass**, 86 before.
+
+---
+
+## 1.4.0 — a character is shown once it is whole
+
+Streaming wrote each token's bytes the moment they arrived. A byte level
+tokenizer splits characters across tokens as a matter of course — `café` in the
+published vocabulary ends on a piece that carries the first byte of `é` and
+nothing else — so a terminal was shown half a character, drew the replacement
+glyph for it, and corrected itself when the next token landed. Every language
+that is not ASCII flickered, and the worse the language fitted the vocabulary
+the more it flickered.
+
+### What it took
+
+- **`ill_utf8_hold`** in the engine, beside `ill_utf8_read`: how many bytes at
+  the end of a buffer begin a sequence that has not finished. It answers zero
+  whenever releasing is the right thing to do, which includes a buffer ending
+  in something that is not valid UTF-8 at all — a writer holding bytes back
+  wants rubbish released rather than a wait for a continuation that is never
+  coming.
+- **`AppTail`** in the command line, carried through a reply. It prepends what
+  it held to the next token's bytes, writes everything whole, and keeps the
+  rest. At most three bytes are ever held. `app_tail_flush` releases them when
+  the reply ends, whether or not they ever became a character, so a run cannot
+  swallow its own last bytes — and it runs on the error path too.
+
+### What it is worth
+
+Nothing is written that was not written before, and nothing is written that
+was: decoding the eight tokens of `こんにちは、世界 😀 naïve café` byte for byte
+matches the build before the change. What moved is *when* — a character reaches
+the terminal once, whole, instead of arriving broken and being repaired.
+
+There is no rate attached to this. It costs a `memcpy` of at most three bytes a
+token against a decode step measured in tens of milliseconds.
+
+### That the harness agrees
+
+Unrelated to the above and closed in the same pass: the full reference
+comparison has now been run against the published `LiquidAI/LFM2.5-2.6B`
+weights rather than against synthetic checkpoints — every architectural shape,
+the cache paths, the tokenizer corpus and the checkpoint branch, 23 of 23. The
+numbers are in the standing results. The parity argument is no longer made
+only on checkpoints the harness built itself.
+
+### Code
+
+`app/core.c` gains `ill_utf8_hold` in part 13. `app/main.c` replaces
+`app_piece_show` with `AppTail`, `app_tail_open`, `app_tail_show` and
+`app_tail_flush`; the run loop and the `tokens` decode path both carry one.
+
+### Tests
+
+Ten cases on the rule itself — ascii, a finished sequence of each width, a lone
+lead byte, two thirds of a three byte sequence, three quarters of a four byte
+one, a byte that leads nothing, continuations with no lead, and an empty
+buffer. Then the property the streaming path actually needs: fed a mixed width
+string one byte at a time, releasing what the rule does not hold reproduces the
+string exactly and never leaves what has been shown ending part way through a
+character.
+
+That last check is walked with the test's own table of how long a lead byte
+promises to be, not with `ill_utf8_hold`. The first draft asked the engine, and
+a check that calls the function it is checking cannot fail: making the rule
+hold nothing left it passing. With the test's own rule it fails, as do the
+three cases that name a held count.
+
+**100 pass**, 89 before.

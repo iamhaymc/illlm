@@ -138,6 +138,17 @@ static void test_numbers(void)
 
 /* -- utf-8 ----------------------------------------------------------------- */
 
+/* How many bytes a lead byte promises, written out here rather than asked of
+ * the engine: a check that calls the function it is checking proves nothing. */
+static int32_t test_utf8_need(unsigned char lead)
+{
+    if (lead < 0x80) return 1;
+    if ((lead & 0xE0) == 0xC0) return 2;
+    if ((lead & 0xF0) == 0xE0) return 3;
+    if ((lead & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
 static void test_utf8(void)
 {
     static const uint32_t runes[] = { 0x41, 0x7F, 0x80, 0xFF, 0x100, 0x7FF, 0x800,
@@ -154,6 +165,68 @@ static void test_utf8(void)
         if (used != span || back != runes[index]) good = 0;
     }
     test_case("write then read round trips", good, "");
+
+    {   /* What a streaming writer must hold back.  The rule is the count of
+           trailing bytes that begin a sequence which has not finished, and it
+           is zero whenever releasing the bytes is the right thing to do -- a
+           complete sequence, or rubbish that no continuation will ever
+           complete. */
+        struct { const char *bytes; int32_t len; int32_t want; const char *what; } cases[] = {
+            { "abc",                 3, 0, "plain ascii holds nothing" },
+            { "a\xC3\xA9",           3, 0, "a finished two byte sequence holds nothing" },
+            { "a\xC3",               2, 1, "a lone lead byte is held" },
+            { "\xE2\x82\xAC",        3, 0, "a finished three byte sequence holds nothing" },
+            { "\xE2\x82",            2, 2, "two thirds of a three byte sequence is held" },
+            { "\xF0\x9F\x98\x80",    4, 0, "a finished four byte sequence holds nothing" },
+            { "\xF0\x9F\x98",        3, 3, "three quarters of a four byte sequence is held" },
+            { "a\xFF",               2, 0, "a byte that leads nothing is released" },
+            { "\x80\x80",            2, 0, "continuations with no lead are released" },
+            { "",                    0, 0, "an empty buffer holds nothing" }
+        };
+        int32_t k;
+        for (k = 0; k < (int32_t)(sizeof cases / sizeof cases[0]); ++k) {
+            int32_t got = ill_utf8_hold(cases[k].bytes, cases[k].len);
+            test_case(cases[k].what, got == cases[k].want, "%d", (int)got);
+        }
+    }
+
+    {   /* The property the streaming path actually needs: feeding a string
+           through the rule one byte at a time and releasing what it does not
+           hold reproduces the string exactly, and never leaves what has
+           been shown ending part way through a character. */
+        const char *whole = "na\xC3\xAFve \xE2\x82\xAC" "5 \xF0\x9F\x98\x80 done";
+        char    seen[64], carry[8];
+        int32_t len = (int32_t)strlen(whole), held = 0, fill = 0, at, split = 0;
+        for (at = 0; at < len; ++at) {
+            char    work[16];
+            int32_t span = held, whole_span;
+            memcpy(work, carry, (size_t)held);
+            work[span++] = whole[at];
+            whole_span = span - ill_utf8_hold(work, span);
+            if (whole_span > 0) {
+                memcpy(seen + fill, work, (size_t)whole_span);
+                fill += whole_span;
+                /* The property a terminal cares about: everything shown so far
+                   ends on a finished character, at every step and not only at
+                   the end.  Walked with the test's own rule, not the engine's. */
+                {
+                    int32_t walk = 0;
+                    while (walk < fill) {
+                        int32_t need = test_utf8_need((unsigned char)seen[walk]);
+                        if (walk + need > fill) { split = 1; break; }
+                        walk += need;
+                    }
+                }
+            }
+            held = span - whole_span;
+            memcpy(carry, work + whole_span, (size_t)held);
+        }
+        memcpy(seen + fill, carry, (size_t)held);
+        fill += held;
+        seen[fill] = '\0';
+        test_case("byte at a time, the held tail reassembles the string",
+                  fill == len && !memcmp(seen, whole, (size_t)len) && !split, "%s", seen);
+    }
 
     {
         uint32_t rune = 0;
