@@ -222,7 +222,7 @@ def do_bench(args):
     code = do_build(args)
     if code != 0:
         return code
-    model = args.model or os.path.join(ROOT, "ckpt", "0.4b")
+    model = args.model or os.path.join(ROOT, "ckpt", "lfm2.5-2.6b-a")
     if not os.path.isdir(model):
         print(f"bench needs a checkpoint: {model} not found; pass --model PATH")
         return 1
@@ -270,7 +270,7 @@ def main():
     parser.add_argument("--sanitize", action="store_true", help="address and ub sanitizers")
     parser.add_argument("--model", default=None, help="checkpoint folder")
     parser.add_argument("--no-checkpoint", action="store_true",
-                        help="skip the checkpoint suite even when ./ckpt/0.4b exists")
+                        help="skip the checkpoint suite even when ./ckpt/lfm2.5-2.6b-a exists")
     parser.add_argument("--filter", default=None, help="subset of reference checks to run")
     # Everything after a literal `--` belongs to app, not to this script,
     # so it is split off before argparse sees it.

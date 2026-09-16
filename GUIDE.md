@@ -29,7 +29,7 @@ Five source files, flat, no build system, plus the published checkpoints in
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
 | `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
 | `data/tune.jsonl` | 202 rows | the tuning corpus |
-| `ckpt/` | — | the published checkpoints: `ckpt/0.4b` (LFM2.5-350M), `ckpt/1.2b` (LFM2.5-1.2B-Instruct), `ckpt/2.6b` (LFM2.5-2.6B) |
+| `ckpt/` | — | the checkpoints; `ckpt/lfm2.5-2.6b-a` is the one this engine runs |
 
 `app/main.c` and `test/test.c` each begin with `#include "core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
@@ -146,7 +146,7 @@ IllState *state;
 float    *logits;
 
 ill_plan_init(&plan);
-plan.model_path  = "path/to/LFM2.5-2.6B";
+plan.model_path  = "path/to/lfm2.5-2.6b-a";
 plan.weight_type = ILL_TYPE_Q8;          /* or ILL_TYPE_KEEP */
 ill_model_load(&model, &plan);
 ill_state_make(&state, model, 4096);
@@ -514,9 +514,10 @@ UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
 A real checkpoint is tested the same way: `make.py test --model PATH` adds a
 logits comparison and a tokenizer comparison against it, for 25 comparisons in
-all. The published checkpoints ship in `ckpt/` (`ckpt/0.4b`, `ckpt/1.2b`,
-`ckpt/2.6b`), with `ckpt/0.4b` (LFM2.5-350M) the default, so this runs by
-default, and it adds two further checks the synthetic suite cannot make:
+all. The published checkpoints ship in `ckpt/` (`ckpt/lfm2.5-2.6b-a-e`,
+`ckpt/lfm2.5-0.5b-x`, `ckpt/lfm2.5-2.6b-a`), with the smallest the default, so
+this runs by default, and it adds two further checks the synthetic suite
+cannot make:
 
 - **throughput** — the engine's `bench` beside transformers doing the same
   shape of work: one batch of 256 tokens, then 64 single-token steps with the

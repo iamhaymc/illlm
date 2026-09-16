@@ -1,0 +1,178 @@
+:root {
+  /* ── Base ── */
+  --vsd-bg:                    #263238;
+  --vsd-fg:                    #d4d4d4;
+  --vsd-focus-border:          #2c383d;
+
+  /* ── Title Bar ── */
+  --vsd-titlebar-bg:           #222d32;
+
+  /* ── Activity Bar ── */
+  --vsd-activitybar-bg:        #20292e;
+  --vsd-activitybar-fg:        #ffffff44;
+  --vsd-activitybar-border:    #00000011;
+  --vsd-activitybar-active-bg: #00000000;
+  --vsd-activitybar-active-border: #009688;
+  --vsd-activitybar-badge-bg:  #ffffff66;
+  --vsd-activitybar-badge-fg:  #000000cc;
+
+  /* ── Side Bar ── */
+  --vsd-sidebar-bg:            #232e33;
+  --vsd-sidebar-fg:            #a7b6b8;
+  --vsd-sidebar-border:        #00000011;
+  --vsd-sidebar-section-bg:    #20292e;
+  --vsd-sidebar-section-fg:    #a7b6b8;
+  --vsd-sidebar-title-fg:      #ffffff44;
+
+  /* ── Panel ── */
+  --vsd-panel-bg:              #273237;
+  --vsd-panel-border:          #232e33;
+  --vsd-panel-title-active-border: #009688;
+
+  /* ── Status Bar ── */
+  --vsd-statusbar-bg:          #232e33;
+  --vsd-statusbar-fg:          #ffffff44;
+  --vsd-statusbar-border:      #ffffff11;
+  --vsd-statusbar-debug-bg:    #ffff4488;
+  --vsd-statusbar-debug-fg:    #000000aa;
+
+  /* ── Editor ── */
+  --vsd-editor-bg:             #263238;
+  --vsd-editor-fg:             #d4d4d4;
+  --vsd-editor-line-highlight: #212b30;
+  --vsd-editor-selection:      #3b4d56;
+  --vsd-editor-find-match:     #0096887a;
+  --vsd-editor-cursor:         #009688;
+  --vsd-editor-gutter-fg:      #3e4b50;
+  --vsd-editor-bracket-match-bg: #354044;
+  --vsd-editor-bracket-match-border: #FF000000;
+
+  /* ── Editor Group ── */
+  --vsd-editor-group-drop-bg:  #00968828;
+
+  /* ── Tabs ── */
+  --vsd-tab-active-bg:         #00000022;
+  --vsd-tab-active-fg:         #ffffff88;
+  --vsd-tab-active-border:     #ffffff11;
+  --vsd-tab-inactive-bg:       #232e33;
+  --vsd-tab-inactive-fg:       #a1b0b2;
+  --vsd-tab-border:            #232e33;
+  --vsd-tabs-bg:               #232e33;
+
+  /* ── Widgets ── */
+  --vsd-editor-widget-bg:      #232e33;
+  --vsd-editor-widget-border:  #29363d;
+
+  /* ── Suggest Widget ── */
+  --vsd-suggest-bg:            #29363d;
+  --vsd-suggest-fg:            #e6f5f3;
+  --vsd-suggest-border:        #29363d;
+  --vsd-suggest-highlight-fg:  #e6f5f3;
+  --vsd-suggest-selected-bg:   #009688;
+
+  /* ── Input ── */
+  --vsd-input-bg:              #00000000;
+  --vsd-input-fg:              #ffffff;
+  --vsd-input-border:          #ffffff11;
+  --vsd-input-placeholder:     #717e82;
+
+  /* ── Dropdown ── */
+  --vsd-dropdown-bg:           #20292e;
+
+  /* ── List / Tree ── */
+  --vsd-list-active-selection-bg: #009688;
+  --vsd-list-active-selection-fg: #dff5f3;
+  --vsd-list-focus-bg:         #076b61;
+  --vsd-list-hover-bg:         #2c383d;
+  --vsd-list-hover-fg:         #a7b6b8;
+  --vsd-list-highlight-fg:     #eeffff;
+  --vsd-list-inactive-focus-bg: #009688;
+  --vsd-list-inactive-selection-bg: #2c383d;
+  --vsd-list-inactive-selection-fg: #dff5f3;
+  --vsd-list-drop-bg:          #009688;
+
+  /* ── Picker ── */
+  --vsd-picker-group-border:   #009688;
+  --vsd-picker-group-fg:       #009688;
+
+  /* ── Scrollbar ── */
+  --vsd-scrollbar-bg:          #00000022;
+  --vsd-scrollbar-shadow:      #263238;
+  --vsd-scrollbar-slider-bg:   #ffffff22;
+  --vsd-scrollbar-slider-hover: #20292ebf;
+  --vsd-scrollbar-slider-active: #a7b6b840;
+
+  /* ── Icons ── */
+  --vsd-icon-fg:               #ffffff44;
+
+  /* ── Debug ── */
+  --vsd-debug-toolbar-bg:      #232e33;
+  --vsd-debug-error-fg:        #ff1111aa;
+  --vsd-debug-warning-fg:      #ffff8866;
+
+  /* ── Diff Editor ── */
+  --vsd-diff-inserted-bg:      #00ff001a;
+  --vsd-diff-removed-bg:       #ff00001a;
+
+  /* ── Git Decorations ── */
+  --vsd-git-untracked:         #52c2d6c2;
+  --vsd-git-modified:          #f5ffbc9f;
+  --vsd-git-deleted:           #EF5350;
+  --vsd-git-conflict:          #f69864;
+  --vsd-git-ignored:           #6a777a;
+
+  /* ── Terminal ── */
+  --vsd-terminal-bg:           #273237;
+  --vsd-terminal-fg:           #d4d4d4;
+  --vsd-terminal-black:        #313131;
+  --vsd-terminal-red:          #ff5d4e;
+  --vsd-terminal-green:        #cddc39;
+  --vsd-terminal-yellow:       #ffcb43;
+  --vsd-terminal-blue:         #4fb6f7;
+  --vsd-terminal-magenta:      #e23673;
+  --vsd-terminal-cyan:         #00b9cc;
+  --vsd-terminal-white:        #e6e5e5;
+  --vsd-terminal-bright-black: #708284;
+  --vsd-terminal-bright-red:   #ff5d4e;
+  --vsd-terminal-bright-green: #cddc39;
+  --vsd-terminal-bright-yellow: #ffcb43;
+  --vsd-terminal-bright-blue:  #4fb6f7;
+  --vsd-terminal-bright-magenta: #e23673;
+  --vsd-terminal-bright-cyan:  #00b9cc;
+  --vsd-terminal-bright-white: #e6e5e5;
+
+  /* ── Syntax: Source / Default ── */
+  --vsd-syntax-default:        #EEFFFF;
+  --vsd-syntax-punctuation:    #89DDF3;
+  --vsd-syntax-string:         #C3E88D;
+  --vsd-syntax-number:         #F78C6A;
+  --vsd-syntax-tag:            #F07178;
+  --vsd-syntax-comment:        #4f6875;
+  --vsd-syntax-keyword:        #C792EA;
+  --vsd-syntax-function:       #82AAFF;
+  --vsd-syntax-class-type:     #FFCB6B;
+  --vsd-syntax-special-var:    #FF5370;
+
+  /* ── Syntax: Extended ── */
+  --vsd-syntax-entity-tag:            #B2CCD6;
+  --vsd-syntax-object-key:            #73d1c8;
+  --vsd-syntax-link:                  #ff869a;
+  --vsd-syntax-punc-operator:         #c792ea6e;
+  --vsd-syntax-punc-bracket:          #c792eaaf;
+  --vsd-syntax-entity-type-class:     #c792eaaf;
+  --vsd-syntax-entity-tag-localname:  #c792ea98;
+  --vsd-syntax-entity-attr-localname: #b4fad985;
+  --vsd-syntax-entity-function:       #f8afafd2;
+  --vsd-syntax-variable:              #ccccccdd;
+  --vsd-syntax-variable-property:     #ccccccaa;
+  --vsd-syntax-boolean:               #fb8aff96;
+  --vsd-syntax-string-quoted:         #c4e0fa94;
+  --vsd-syntax-plain-text:            #ffffffee;
+
+  /* ── Font ── */
+  --vsd-font-family: "'SF Mono', 'Cascadia Code', 'Consolas', monospace";
+  --vsd-font-size: 12.4px;
+
+  /* ── Misc ── */
+  --vsd-accent: #009688;
+}

@@ -1,0 +1,17 @@
+Look at the image and evaluate whether the predicted values are correct for each attribute.
+
+Attributes (with descriptions and predictions):
+$attributes
+
+Each prediction should be an observation about the image (a word, number, or natural-language phrase like "partly cloudy" or "lying horizontally"), NOT a restatement of the description/question itself.
+
+For each attribute, rate how correct the prediction is based on what you see in the image, on a 0.0-1.0 scale:
+- 1.0: Exactly correct or semantically identical
+- 0.7-0.9: Mostly correct with minor differences
+- 0.3-0.6: Partially correct
+- 0.0-0.2: Incorrect, unrelated, or just rephrases the description instead of giving a specific value
+
+Respond with ONLY a JSON object mapping each attribute name to its score. Example:
+{"attr1": 0.9, "attr2": 0.3, "attr3": 1.0}
+
+No text outside the JSON.

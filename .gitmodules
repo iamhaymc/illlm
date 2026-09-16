@@ -1,0 +1,9 @@
+[submodule "docs/lfm"]
+	path = docs/lfm
+	url = https://github.com/Liquid4All/cookbook
+[submodule "ckpt/yolo26/py"]
+	path = ckpt/yolo26/py
+	url = https://github.com/ultralytics/ultralytics
+[submodule "_tmp_qwen_space"]
+	path = _tmp_qwen_space
+	url = https://huggingface.co/spaces/Qwen/Qwen-Image

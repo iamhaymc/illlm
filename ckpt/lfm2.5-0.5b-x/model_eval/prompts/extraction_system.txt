@@ -1,0 +1,5 @@
+Extract the following from the image:
+
+$schema
+
+Respond with only a JSON object. Do not include any text outside the JSON.

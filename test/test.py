@@ -12,9 +12,10 @@ Two modes:
               No download is needed, so it runs anywhere transformers does.
 
   checkpoint  `--model PATH` points at a real checkpoint.  The default is the
-               `ckpt/0.4b` folder at the repo root, which carries the published
-              LFM2.5-350M weights; `ckpt/1.2b` and `ckpt/2.6b` hold the larger
-              checkpoints.  Against it the suite adds a tokenizer agreement
+              `ckpt/lfm2.5-2.6b-a` folder at the repo root, which is the only
+              checkpoint here this engine can run -- the others are an encoder
+              and a vision-language model.  Against it the suite adds a
+              tokenizer agreement
               check, a throughput comparison -- the engine's `bench` beside
               transformers doing the same shape of work at the same weight
               width -- and a greedy continuation compared on the text, judged
@@ -25,7 +26,7 @@ Two modes:
 
 usage
   python3 test/test.py --binary ./build/app_main
-  python3 test/test.py --binary ./build/app_main --model ckpt/2.6b
+  python3 test/test.py --binary ./build/app_main --model ckpt/lfm2.5-2.6b-a
   python3 test/test.py --filter conv          # run a subset by name
 """
 
@@ -41,10 +42,12 @@ import time
 
 # The published checkpoints ship in the repository under ckpt/, so the
 # checkpoint suite runs by default; pass --model to point somewhere else, or
-# --no-checkpoint to skip it entirely.  The default is the smallest checkpoint,
-# ckpt/0.4b (LFM2.5-350M); ckpt/1.2b and ckpt/2.6b hold the larger ones.
+# --no-checkpoint to skip it entirely.  The default is ckpt/lfm2.5-2.6b-a,
+# which is the only checkpoint in the repository this engine can run: the
+# others are an encoder (Lfm2BidirectionalForMaskedLM) and a vision-language
+# model (lfm2_vl), and this engine is a causal decoder for lfm2.
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "ckpt", "0.4b")
+                             "ckpt", "lfm2.5-2.6b-a")
 
 # ---------------------------------------------------------------------------
 # harness
@@ -758,9 +761,9 @@ def main():
     parser.add_argument("--binary", default="./build/app_main",
                         help="path to the compiled CLI (default ./build/app_main)")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="checkpoint folder to test against (default ./ckpt/0.4b)")
+                        help="checkpoint folder to test against (default ./ckpt/lfm2.5-2.6b-a)")
     parser.add_argument("--no-checkpoint", action="store_true",
-                        help="skip the checkpoint suite even when ./ckpt/0.4b exists")
+                        help="skip the checkpoint suite even when ./ckpt/lfm2.5-0.4b exists")
     parser.add_argument("--filter", default=None, help="only run checks whose name contains this")
     parser.add_argument("--keep", action="store_true", help="keep the synthetic checkpoints")
     args = parser.parse_args()
