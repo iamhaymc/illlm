@@ -15,7 +15,7 @@ app_test.c    unit tests for the engine internals
 app_test.py   comparison against the reference implementation
 app_tune.py   fine tuning on the reference side, the caveman rule engine,
               and the heretic abliteration pass
-data_tune.jsonl  the tuning corpus, 202 rows
+datasets/data_tune.jsonl  the tuning corpus, 202 rows
 run.py        workflows: install, build, test, run
 model/        the published LFM2.5-2.6B checkpoint, used by the test suite
 GUIDE.md      a tour of how it all works

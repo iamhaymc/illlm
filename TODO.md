@@ -56,7 +56,7 @@ for the engine to run correctly today.
   and what it cost: refusals on the held out harmful prompts beside the base's,
   and a `--check` afterwards to say whether the register and the answers
   survived the edit. It needs a card, not a change.
-- Grow `data_tune.jsonl` past its 202 hand written rows with `--make-data`
+- Grow `datasets/data_tune.jsonl` past its 202 hand written rows with `--make-data`
   against a published reasoning corpus. The press is deletion only and takes
   about 29% off the prose it is given, which is the floor rather than the
   ceiling: a hand written caveman answer restructures and reaches 2.4x. The
