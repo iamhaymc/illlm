@@ -10,7 +10,10 @@
 A fast and tiny engine for agents.
 
 It offers utilities related to:
-inference, encoding, extraction, vision, speech
+- inference & basic tools
+- text encoding & extraction, 
+- vision & imaging
+- speech & transcription
 
 It is written in pure and optimized C11,
 cross-platform, and designed for acceleration.
