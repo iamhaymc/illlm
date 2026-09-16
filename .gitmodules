@@ -4,9 +4,6 @@
 [submodule "ckpt/yolo26/py"]
 	path = ckpt/yolo26/py
 	url = https://github.com/ultralytics/ultralytics
-[submodule "ckpt/lfm2.5-0.5b-x"]
-	path = ckpt/lfm2.5-0.5b-x
-	url = https://huggingface.co/LiquidAI/LFM2.5-VL-450M-Extract
 [submodule "_tmp_qwen_space"]
 	path = _tmp_qwen_space
 	url = https://huggingface.co/spaces/Qwen/Qwen-Image
