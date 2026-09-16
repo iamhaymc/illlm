@@ -32,6 +32,20 @@ for the engine to run correctly today.
   before that target can enable the pool.
 - Add a perplexity command so accuracy loss from `--quant q8` can be reported as
   a number rather than as a correlation.
+- Run the caveman tune against the published weights. **Blocked**: the pipeline
+  in `app_tune.py` is verified end to end on a synthetic six layer Liquid
+  checkpoint carrying the real tokenizer and chat template -- the loss mask
+  covers the assistant span and nothing before it, the adapter reaches 34 of
+  the 35 linear layers, the merge preserves the checkpoint's own dtype, the
+  anchor term is exactly zero at initialisation and the `--check` pass runs --
+  but no tune has been taken over the 2.6B weights, so there is no number for
+  what the register costs in accuracy. It needs a card, not a change.
+- Grow `data_tune.jsonl` past its 202 hand written rows with `--make-data`
+  against a published reasoning corpus. The press is deletion only and takes
+  about 29% off the prose it is given, which is the floor rather than the
+  ceiling: a hand written caveman answer restructures and reaches 2.4x. The
+  rows that press well are the verbose ones, so a corpus of terse answers is
+  the wrong source.
 
 ## Performance
 
