@@ -56,7 +56,7 @@ output shrank beside how much of the answer survived.
 The corpus
 ----------
 
-`data_tune.jsonl` beside this script, one JSON object per line:
+`datasets/data_tune.jsonl` beside this script, one JSON object per line:
 
     prompt      required, the user turn
     thinking    required, the reasoning that goes inside <think>...</think>
@@ -229,7 +229,7 @@ ADAPTER_PATH = os.path.join(TUNE_PATH, "adapter")
 MERGED_PATH = os.path.join(TUNE_PATH, "merged")
 UNCENSOR_PATH = os.path.join(TUNE_PATH, "uncensored")
 UNCENSOR_STUDY = os.path.join(TUNE_PATH, "uncensor-study")
-DATA_PATH = os.path.join(ROOT_PATH, "data_tune.jsonl")
+DATA_PATH = os.path.join(ROOT_PATH, "datasets", "data_tune.jsonl")
 
 # A style change is a small change, and the corpus is a few hundred rows of it.
 # These defaults train it in one pass on one card; raise the epochs with the
@@ -1672,7 +1672,7 @@ def main():
             return 0
         # Into build/, which run.py generates and git ignores: the source tree's
         # file list is closed, and a generated corpus is not part of it. Merge
-        # what survives into data_tune.jsonl by hand, or point --data at it.
+        # what survives into datasets/data_tune.jsonl by hand, or point --data at it.
         out_path = flag.out or os.path.join(TUNE_PATH, "data_more.jsonl")
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         make_data(flag.source, out_path, flag.think_level, flag.reply_level,
