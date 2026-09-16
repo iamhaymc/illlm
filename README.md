@@ -34,8 +34,8 @@ python3 util/make.py run -- generate --model DIR --prompt "hello"
 
 `make.py test` needs `torch` and `transformers`, which `python3 util/make.py install`
 provides. The engine itself has no dependencies at all. The published
-checkpoints ship in `ckpt/` — `ckpt/lfm2.5-0.4b` (LFM2.5-350M), `ckpt/lfm2.5-1.2b-i`
-(LFM2.5-1.2B-Instruct), and `ckpt/lfm2.5-2.6b-a` (LFM2.5-2.6B) — so the checkpoint
+checkpoints ship in `ckpt/` — `ckpt/lfm2.5-0.4b` (LFM2.5-350M) and
+`ckpt/lfm2.5-2.6b-a` (LFM2.5-2.6B) — so the checkpoint
 suite — logits, tokenizer, throughput, and greedy behaviour against the
 reference — runs by default against `ckpt/lfm2.5-0.4b`; `--no-checkpoint` skips it,
 and `--model PATH` points somewhere else.

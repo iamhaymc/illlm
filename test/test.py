@@ -13,8 +13,8 @@ Two modes:
 
   checkpoint  `--model PATH` points at a real checkpoint.  The default is the
                `ckpt/lfm2.5-0.4b` folder at the repo root, which carries the published
-              LFM2.5-350M weights; `ckpt/lfm2.5-1.2b-i` and `ckpt/lfm2.5-2.6b-a` hold the larger
-              checkpoints.  Against it the suite adds a tokenizer agreement
+              LFM2.5-350M weights; `ckpt/lfm2.5-2.6b-a` holds the larger
+              checkpoint.  Against it the suite adds a tokenizer agreement
               check, a throughput comparison -- the engine's `bench` beside
               transformers doing the same shape of work at the same weight
               width -- and a greedy continuation compared on the text, judged
@@ -42,7 +42,7 @@ import time
 # The published checkpoints ship in the repository under ckpt/, so the
 # checkpoint suite runs by default; pass --model to point somewhere else, or
 # --no-checkpoint to skip it entirely.  The default is the smallest checkpoint,
-# ckpt/lfm2.5-0.4b (LFM2.5-350M); ckpt/lfm2.5-1.2b-i and ckpt/lfm2.5-2.6b-a hold the larger ones.
+# ckpt/lfm2.5-0.4b (LFM2.5-350M); ckpt/lfm2.5-2.6b-a holds the larger one.
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "ckpt", "0.4b")
 

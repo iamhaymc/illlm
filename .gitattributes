@@ -8,8 +8,6 @@
 # or `eol` rules here, so adding this file renormalizes nothing.
 ckpt/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
 ckpt/**/tokenizer.json filter=lfs diff=lfs merge=lfs -text
-ckpt/lfm2.5-1.2b-i/model.safetensors filter=lfs diff=lfs merge=lfs -text
-ckpt/lfm2.5-1.2b-i/model.safetensors !text !filter !merge !diff
 
 ckpt/**/*.pt filter=lfs diff=lfs merge=lfs -text
 data/*.zip filter=lfs diff=lfs merge=lfs -text
