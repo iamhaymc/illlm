@@ -310,25 +310,35 @@ def check_storage(binary, root, filter_text):
 
 
 def check_quant(binary, root, filter_text):
-    """q8 is lossy by design, so it is judged on agreement, not on distance."""
+    """A block format is lossy by design, so it is judged on agreement with the
+    reference rather than on distance from it.
+
+    q4 is held to a looser bar than q8 because four bits over a 32 value block
+    is about eight times q8's step. The bar is not a prediction: what the format
+    costs in accuracy is a perplexity number, and `app_main perplexity` is where
+    that is taken. This check is here to catch a packing bug, which looks like
+    agreement collapsing rather than like a tenth of a nat.
+    """
     import numpy as np
 
-    label = "storage/q8_repack"
-    if filter_text and filter_text not in label:
-        return
-    announce(label, "top-1 agreement and correlation")
-    folder, vocab_size = build_model(root, "quant", SHAPES["hybrid_stack"])
-    ids = token_run(vocab_size, 16)
-    want = reference(folder, ids)
-    got = engine_rows(binary, folder, ids, vocab_size, "--every", "--quant", "q8")
-    agree = float((want.argmax(axis=1) == got.argmax(axis=1)).mean())
-    a = want - want.mean(axis=1, keepdims=True)
-    b = got - got.mean(axis=1, keepdims=True)
-    scale = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
-    live = scale > 0
-    tie = float(np.mean((a[live] * b[live]).sum(1) / scale[live])) if live.any() else 1.0
-    record(label, agree >= 0.75 and tie > 0.99,
-           f"top-1 {agree:.0%}, correlation {tie:.4f}")
+    for flavour, floor, tie_floor in (("q8", 0.75, 0.99), ("q4", 0.50, 0.95)):
+        label = f"storage/{flavour}_repack"
+        if filter_text and filter_text not in label:
+            continue
+        announce(label, "top-1 agreement and correlation")
+        folder, vocab_size = build_model(root, "quant", SHAPES["hybrid_stack"])
+        ids = token_run(vocab_size, 16)
+        want = reference(folder, ids)
+        got = engine_rows(binary, folder, ids, vocab_size, "--every",
+                          "--quant", flavour)
+        agree = float((want.argmax(axis=1) == got.argmax(axis=1)).mean())
+        a = want - want.mean(axis=1, keepdims=True)
+        b = got - got.mean(axis=1, keepdims=True)
+        scale = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+        live = scale > 0
+        tie = float(np.mean((a[live] * b[live]).sum(1) / scale[live])) if live.any() else 1.0
+        record(label, agree >= floor and tie > tie_floor,
+               f"top-1 {agree:.0%}, correlation {tie:.4f}")
 
 
 def check_threads(binary, root, filter_text):

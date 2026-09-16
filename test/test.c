@@ -404,6 +404,94 @@ static void test_kernels(void)
             test_case(name, test_gap(want, got, tile * TEST_ROWS) < 0.05f, "%.1e",
                       (double)test_gap(want, got, tile * TEST_ROWS));
         }
+        {   /* q4 against the same naive f32 the q8 sweep is judged on.  Four
+               bits over a 32 value block is about eight times q8's step, so
+               the bar is eight times q8's; anything much past it is a packing
+               bug rather than the format. */
+            int32_t  qb = ill_q8_blocks(TEST_COLS);
+            uint8_t *wn = (uint8_t *)ill_block_make((size_t)TEST_ROWS * qb * ILL_Q4_BYTES);
+            float   *ns = (float *)ill_block_make((size_t)TEST_ROWS * qb * sizeof(float));
+            IllPlane nib = plane;
+            int32_t  k;
+            for (k = 0; k < TEST_ROWS; ++k)
+                ill_q4_pack(w + (size_t)k * TEST_COLS, TEST_COLS,
+                            wn + (size_t)k * qb * ILL_Q4_BYTES, ns + (size_t)k * qb);
+            nib.cells = wn; nib.steps = ns; nib.type = ILL_TYPE_Q4; nib.blocks = qb;
+            for (k = 1; k <= ILL_TILE_MAX; ++k) {
+                char name[52];
+                memset(got, 0, TEST_TOKS * TEST_ROWS * sizeof(float));
+                ill_dense_nib(&nib, xq, TEST_COLS, xs, blocks, k, 0, TEST_ROWS,
+                              got, TEST_ROWS);
+                snprintf(name, sizeof name, "q4 dense tracks f32, %d token tile", k);
+                test_case(name, test_gap(want, got, k * TEST_ROWS) < 0.13f, "%.1e",
+                          (double)test_gap(want, got, k * TEST_ROWS));
+            }
+            {   /* A row read back has to agree with what the dot product is
+                   using, or the two disagree about what the weights are. */
+                float row[TEST_COLS];
+                ill_plane_row(&nib, 3, row);
+                test_case("q4 row read matches its scale",
+                          test_gap(w + 3 * TEST_COLS, row, TEST_COLS) < 0.15f, "%.1e",
+                          (double)test_gap(w + 3 * TEST_COLS, row, TEST_COLS));
+            }
+            {   /* The accuracy the format promises: a value comes back
+                   within half a step, and a step is the block's peak over
+                   eight because all sixteen levels are used.  Placing the
+                   extreme on -8 is what buys that eighth -- dividing the peak
+                   by seven and clipping would widen the step by a seventh and
+                   fail here.  The fixture keeps clear of the far end, which is
+                   the one place this scheme is asymmetric. */
+                float   cell[ILL_Q8_BLOCK], step, peak = 13.0f, worst = 0.0f;
+                uint8_t packed[ILL_Q4_BYTES];
+                int8_t  lift[ILL_Q8_BLOCK];
+                int32_t j2;
+                for (j2 = 0; j2 < ILL_Q8_BLOCK; ++j2)
+                    cell[j2] = (float)(j2 % 9) - 3.0f;     /* -3 .. 5 */
+                cell[9] = -peak;                           /* the extreme */
+                ill_q4_pack(cell, ILL_Q8_BLOCK, packed, &step);
+                ill_q4_lift(packed, lift);
+                for (j2 = 0; j2 < ILL_Q8_BLOCK; ++j2) {
+                    float back = (float)lift[j2] * step;
+                    float off  = back - cell[j2];
+                    if (off < 0.0f) off = -off;
+                    if (off > worst) worst = off;
+                }
+                test_case("q4 comes back within half a step of peak over eight",
+                          worst <= peak / 16.0f + 1e-4f, "%.4f against %.4f",
+                          (double)worst, (double)(peak / 16.0f));
+            }
+
+            {   /* The lift that feeds the dot and the lift that reads a row
+                   are different code on any machine with vectors, and they
+                   have to agree about which nibble is which value.  Compared
+                   through the dot, because the register form has no bytes to
+                   look at. */
+                int8_t  flat[2 * ILL_Q8_BLOCK];
+                int8_t  act[2 * ILL_Q8_BLOCK];
+                uint8_t two[2 * ILL_Q4_BYTES];
+                float   cell[2 * ILL_Q8_BLOCK], steps[2];
+                float   a, b2;
+                int32_t j2;
+                for (j2 = 0; j2 < 2 * ILL_Q8_BLOCK; ++j2) {
+                    cell[j2] = (float)((j2 * 37) % 23) - 11.0f;
+                    act[j2]  = (int8_t)(((j2 * 53) % 61) - 30);
+                }
+                ill_q4_pack(cell, ILL_Q8_BLOCK, two, &steps[0]);
+                ill_q4_pack(cell + ILL_Q8_BLOCK, ILL_Q8_BLOCK,
+                            two + ILL_Q4_BYTES, &steps[1]);
+                ill_q4_lift(two, flat);
+                ill_q4_lift(two + ILL_Q4_BYTES, flat + ILL_Q8_BLOCK);
+                a  = ill_q8_fold(ill_q8_pair(ill_q8_zero(), flat, act, 0.5f, 0.25f));
+                b2 = ill_q8_fold(ill_q4_dot(ill_q8_zero(), ill_q4_open(two),
+                                            act, 0.5f, 0.25f));
+                test_case("the register lift agrees with the byte lift",
+                          test_near(a, b2, 1e-3f), "%.4f vs %.4f",
+                          (double)a, (double)b2);
+            }
+
+            ill_block_free(wn); ill_block_free(ns);
+        }
+
         {   /* The paired dot must be the two single block dots it stands
                for.  On a VNNI build it is a different instruction reading the
                weights unsigned, so this is the check that the sign moved onto
@@ -976,9 +1064,12 @@ static void test_paths(void)
               ill_result_text((IllResult)99), "");
     test_case("type names cover every format",
               !strcmp(ill_type_text(ILL_TYPE_Q8), "q8") &&
+              !strcmp(ill_type_text(ILL_TYPE_Q4), "q4") &&
               !strcmp(ill_type_text(ILL_TYPE_BF16), "bf16") &&
               ill_type_size(ILL_TYPE_BF16, 10) == 20 &&
-              ill_type_size(ILL_TYPE_Q8, 10) == 10, "");
+              ill_type_size(ILL_TYPE_Q8, 10) == 10 &&
+              ill_type_size(ILL_TYPE_Q4, 10) == 5 &&
+              ill_type_size(ILL_TYPE_Q4, 9) == 5, "");
 }
 
 /* -- entry ----------------------------------------------------------------- */

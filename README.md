@@ -18,7 +18,10 @@ python3 util/make.py build                             # a few seconds, no depen
 ./build/app_main chat      --model ckpt/0.4b
 ```
 
-Add `--quant q8` to halve the memory and roughly double decode speed. Add
+Add `--quant q8` to halve the memory and roughly double decode speed, or
+`--quant q4` to halve it again — 1.57 GiB for the 2.6B, and 1.23x q8's decode.
+Read what q4 costs before choosing it: on ordinary prose, nothing a perplexity
+can see; on text the model should find easy, most of its confidence. Add
 `--draft 4` to greedy decoding to verify four context-drafted tokens in each
 pass, which is worth about a quarter on work whose answer quotes its question
 and costs nothing when it does not. Add
@@ -102,7 +105,7 @@ and biased convolution kernels; f32, f16, and bf16 storage; chunked prefill and
 single token decode; and tokenizer agreement over a corpus of awkward strings.
 
 Against float32 checkpoints the engine matches the reference to **2e-7
-relative**, which is float32 rounding. `test/test.c` adds 108 unit checks over
+relative**, which is float32 rounding. `test/test.c` adds 119 unit checks over
 the internals. Both suites run clean under AddressSanitizer and
 UndefinedBehaviorSanitizer.
 
@@ -113,14 +116,17 @@ convolution, model dim 2048, feed forward 10752, 32 query heads over 8
 key-value heads, vocabulary 128000 — on four x86-64 cores at 2.80 GHz with
 AVX-512 and VNNI, at q8:
 
-|         | weights  | prefill, 256 tok | decode    |
-| ------- | -------- | ---------------- | --------- |
-| q8      | 2.83 GiB | 32.6 tok/s       | 10.7 tok/s |
+|         | weights  | prefill, 256 tok | decode     |
+| ------- | -------- | ---------------- | ---------- |
+| q8      | 2.83 GiB | 32.2 tok/s       | 9.7 tok/s  |
+| q4      | 1.57 GiB | 30.0 tok/s       | 11.9 tok/s |
 
-Decode on that host is 32.5 GB/s of weight traffic against a 36.6 GB/s bare
-memory sweep, which is 89% of what the machine can fetch — decode is the memory
-and there is little left in the kernel. Prefill is arithmetic bound and sits at
-88 G multiply-adds a second.
+q8 decode on that host is 32.5 GB/s of weight traffic against a 36.6 GB/s bare
+memory sweep, which is 89% of what the machine can fetch — at q8 decode is the
+memory and there is little left in the kernel. q4 reads fewer bytes and comes
+off that ceiling: 20.0 GB/s, with the unpack and the dot deciding the rate
+instead. Prefill is arithmetic bound throughout, which is why q4 is slower at
+it than q8.
 
 A synthetic 2.9B-parameter checkpoint of LFM2-2.6B proportions — 32 layers,
 model dim 2560, feed forward 8192, vocabulary 65536 — on an earlier four-core

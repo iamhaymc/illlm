@@ -24,7 +24,7 @@ Five source files, flat, no build system, plus the published checkpoints in
 | --- | --- | --- |
 | `app/core.c` | ~4500 | the engine: a header and its implementation in one file |
 | `app/main.c` | ~670 | the command line, six verbs |
-| `test/test.c` | ~980 | unit tests over the engine internals |
+| `test/test.c` | ~1050 | unit tests over the engine internals |
 | `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
 | `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
@@ -251,6 +251,13 @@ That leaves exactly one horizontal reduction per output row. On AVX-512BW a
 32-value block widens to precisely one register of int16, so a block costs a
 single multiply-add.
 
+q4 is the same block with the values at half the width, two to a byte: sixteen
+bytes and one scale where q8 spends thirty-two and one. The block's largest
+value is placed exactly on -8, so all sixteen levels are used and the scale
+carries a sign. A block lifts into the signed bytes the q8 dot already reads —
+and on any machine with vectors it lifts straight into the register, never
+through memory.
+
 Where VNNI is present the loop takes blocks in pairs instead, because two
 blocks are 64 bytes and that is one 512 bit register whole:
 
@@ -442,7 +449,9 @@ app_main perplexity  score a text, so an accuracy trade has a number
 
 `app_main help` lists every flag. Three are worth knowing:
 
-- `--quant q8` repacks at load: half the memory, roughly double the decode rate.
+- `--quant q8` repacks at load: half the memory, roughly double the decode
+  rate. `--quant q4` halves it again for 1.23x q8's decode, at an accuracy
+  cost that is invisible on prose and severe on text the model is sure about.
 - `--draft N` proposes `N` tokens from the context and verifies them in the
   same pass, which is worth about a quarter on work whose answer quotes its
   question and nothing on work that invents every token. Greedy only, and the
@@ -469,7 +478,7 @@ trades accuracy for speed can be judged rather than argued about; the cost of
 
 Three layers, each catching what the others cannot.
 
-**`test/test.c` — 108 unit checks.** Number formats against their definitions;
+**`test/test.c` — 119 unit checks.** Number formats against their definitions;
 the JSON reader against nested documents, escapes, surrogates, and eight
 malformed inputs; every kernel against a plain-C restatement of the same
 arithmetic written independently in the test, at every tile width the dispatch
@@ -479,7 +488,8 @@ equations, including the convolution window carried across calls; the thread
 pool for exact-once execution over many widths and repeated forks; the
 pre-tokenizer chunk by chunk; the merge heap; the row normaliser a score is
 built on; the rule that decides when a streamed character is whole; the scan
-that drafts a continuation from the context; and the sampler for seed replay,
+that drafts a continuation from the context; the q4 pack and both of its
+lifts; and the sampler for seed replay,
 nucleus containment, and repetition demotion.
 
 **`test/test.py` — 19 comparisons against `transformers`.** Small Liquid
@@ -503,7 +513,7 @@ Against f32 checkpoints the engine matches to 2e-7 relative — float32 rounding
 UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
 A real checkpoint is tested the same way: `make.py test --model PATH` adds a
-logits comparison and a tokenizer comparison against it, for 24 comparisons in
+logits comparison and a tokenizer comparison against it, for 25 comparisons in
 all. The published checkpoints ship in `ckpt/` (`ckpt/0.4b`, `ckpt/1.2b`,
 `ckpt/2.6b`), with `ckpt/0.4b` (LFM2.5-350M) the default, so this runs by
 default, and it adds two further checks the synthetic suite cannot make:
@@ -542,7 +552,8 @@ VNNI — the `xeon-2.8` host in `CHANGES.md`'s standing results:
 
 | | weights | prefill, 256 tok | decode |
 | --- | --- | --- | --- |
-| q8 | 2.83 GiB | 32.6 tok/s | 10.7 tok/s |
+| q8 | 2.83 GiB | 32.2 tok/s | 9.7 tok/s |
+| q4 | 1.57 GiB | 30.0 tok/s | 11.9 tok/s |
 
 Decode there is 32.5 GB/s of weight traffic against a 36.6 GB/s bare memory
 sweep — 89% of what the host can fetch, so the decode kernel has about a tenth
@@ -577,6 +588,14 @@ dispatch is free.
 Add the enum value, a loader in the vector vocabulary, a case in
 `ILL_DENSE_TYPED`, a case in `ill_plane_row`, and a branch in
 `ill_model_plane`. Nothing else knows the difference.
+
+A *block* format is more than that, because it does not read through the f32
+vocabulary at all: q4 is the worked example — `ill_q4_pack`, a lift, its own
+dense body, and `ill_model_pack` told which format it is packing into. If the
+format is narrower than a byte, make the lift produce a register the dot reads
+rather than a buffer it reloads. That single choice is the difference between
+q4 decoding 1.23x faster than q8 and 1.8x slower; the entry for 1.6.0 has the
+three measurements.
 
 ### A new tokenizer family
 

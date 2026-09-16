@@ -30,26 +30,39 @@ one token out of a read, and not about faster arithmetic: there is 11% left in
 the kernel and the rest has to come from somewhere else.
 
 Prefill is arithmetic bound instead, and has further to go: 32.6 tok/s on the
-same host is 88 G multiply-adds a second.
+same host is 88 G multiply-adds a second. That is also why a narrower weight
+format helps decode and hurts prefill — q4 (1.6.0) is 1.23x on decode and
+0.93x on prefill, because unpacking is arithmetic and prefill has none to
+spare.
 
 That ceiling is a ceiling on **reads**, not on tokens. `--draft` (1.5.0) gets
 more than one token out of a read by verifying proposals in the same pass, and
 takes greedy decoding to 11.8 tok/s on work whose answer quotes its question —
 past the bare-read figure, because the read is no longer one token's.
 
-### What q8 costs
+### What a weight format costs
 
 Measured by `perplexity` (1.3.0) on the published 2.6B checkpoint, over two
-unlike texts — technical prose and licence boilerplate:
+unlike texts — technical prose, and licence boilerplate a model has seen many
+times:
 
-| | bf16, as stored | q8, repacked |
+| | `GUIDE.md` prose, 2056 tokens | Apache licence, 1900 tokens |
 | --- | --- | --- |
-| `GUIDE.md` prose, 2056 tokens | 3.6080 nats — 36.892 | 3.5999 nats — 36.594 |
-| Apache licence, 1900 tokens | 0.6798 nats — 1.9734 | 0.6756 nats — 1.9651 |
+| bf16, as stored | 3.6080 nats — 36.892 | 0.6798 nats — 1.9734 |
+| q8, repacked | 3.5999 nats — 36.594 | 0.6756 nats — 1.9651 |
+| q4, repacked | 3.5805 nats — 35.892 | 1.2642 nats — **3.5401** |
 
-**The cost is below what the measurement can see** — under a quarter of a
-percent on both, and falling the wrong way for a lossy format. The sign is not
-a result; the size is. Anything narrower than q8 is judged against this row.
+**q8 costs nothing this measurement can see** — under a quarter of a percent on
+both, and falling the wrong way for a lossy format, so the sign is not a result
+and the size is.
+
+**q4 costs nothing on the prose and most of the licence.** The prose number
+moves less than q8's did; the licence number nearly doubles, 0.68 nats a token
+to 1.26. That gap is the whole lesson: **a perplexity taken on ordinary prose
+does not see what four bits costs**, because prose is where the model is
+unsure anyway and a blurred distribution is still about as wrong. Where the
+model is confident, four bits is where the confidence goes. Judge a narrow
+format on text it should find easy.
 
 ### The published checkpoint
 
@@ -70,6 +83,15 @@ pass**:
 
 Ideas that were tried, measured, and are not worth having. They are here so
 that the next person does not have the same idea twice.
+
+- **Keeping the vocabulary plane at q8 while the body is q4** (1.6.0). The
+  standard remedy for a lossy weight format is to spare the output head, which
+  on this checkpoint is tied to the embedding and is 262M of 2.69B parameters —
+  1.57 GiB becomes 1.69 GiB, which is cheap. It measured **worse**, on both
+  texts and by about the same margin: prose 35.892 to 38.339, licence 3.5401 to
+  3.8450. No account of why is offered, because none was established; what is
+  established is that the obvious move does not pay here and should not be
+  made again without a reason better than that it usually works.
 
 - **Memoising the q8 activation pack** (1.2.0). Three planes in attention and
   two in the feed forward read the same normalised row, so the same bytes are
@@ -754,3 +776,124 @@ at character 34, and dropping the fill rewind parts them at 37.
 
 **108 pass**, 100 before, and 24 in the reference harness against the 2.6B,
 23 before.
+
+---
+
+## 1.6.0 — q4, and what four bits actually costs
+
+q8 puts the 2.6B checkpoint in 2.83 GiB. A machine with 4 GiB of usable memory
+cannot hold that beside anything else, and decode is bytes over bandwidth, so
+the format is both the memory question and the speed question.
+
+### What it took
+
+- **`ILL_TYPE_Q4`**: the same 32 value block as q8 with the values at half the
+  width, two to a byte. Twenty bytes a block against thirty-six, so a
+  checkpoint reads 0.56 of what it read at q8.
+
+  The sixteen levels are used by placing the block's largest value exactly on
+  -8 rather than by dividing its magnitude by eight and clipping, which would
+  hand back seven eighths of the peak. The scale therefore carries a sign,
+  which costs nothing — it is a float multiply at the end of a row.
+
+  Within a block the low nibbles of the sixteen bytes hold values 0..15 and the
+  high nibbles 16..31, so a block lifts in two halves rather than by striding
+  through it two at a time.
+
+- **A lift that never touches memory.** This is the whole of whether the format
+  pays, and it took three attempts to see it:
+
+  | the lift | q4 decode | against q8's 11.0 |
+  | --- | --- | --- |
+  | sixteen scalar iterations a block | 1.5 tok/s | **7x slower** |
+  | vectorised, through a 64 byte buffer | 5.1 tok/s | 1.8x slower |
+  | vectorised, into a register the dot reads | 11.9 tok/s | **1.23x faster** |
+
+  The first two read *fewer* bytes than q8 and lost anyway. Unpacking is
+  arithmetic, and a decode step that was 89% of the memory ceiling has no
+  arithmetic to spare; a store and a reload of sixty-four bytes per block pair
+  was enough to give the whole saving back. `ill_q4_open` lifts two blocks --
+  thirty-two bytes -- into one 512 bit register with five instructions, and
+  `ill_q8_pair_wide` takes the weights from a register rather than a pointer so
+  q8 and q4 share the dot.
+
+### What it is worth
+
+The published 2.6B on `xeon-2.8`, minimum over three alternations with q8 going
+first:
+
+| | weights | prefill, 256 tok | decode |
+| --- | --- | --- | --- |
+| q8 | 2.83 GiB | 7.953 s — 32.2 tok/s | 4.933 s — 9.7 tok/s |
+| q4 | 1.57 GiB | 8.522 s — 30.0 tok/s | 4.026 s — 11.9 tok/s |
+
+**0.55 of the memory and 1.23x the decode, for 0.93x the prefill.** The prefill
+loss is the same fact as the decode gain seen from the other side: prefill is
+arithmetic bound, and the unpack is arithmetic it cannot absorb.
+
+The decode gain is well short of the 1.8x the byte count suggests, because q4
+decode is no longer waiting on memory: 11.9 tok/s over 1.57 GiB is 20.0 GB/s
+against a 36.6 GB/s sweep. It is the first thing in this engine to come off the
+memory ceiling, and what holds it now is the kernel.
+
+### What it costs
+
+This is the number the `perplexity` command was built for, and it is not the
+number an ordinary benchmark would have reported:
+
+| | prose | licence boilerplate |
+| --- | --- | --- |
+| q8 | 36.594 | 1.9651 |
+| q4 | 35.892 | **3.5401** |
+
+**On prose, q4 costs nothing visible. On text the model should find easy, it
+costs most of the model's confidence** — 0.68 nats a token to 1.26. Had only
+the prose corpus been run, q4 would have looked free, and it is not. A narrow
+format has to be judged on text the model is sure about, because that is where
+the certainty it is destroying lives.
+
+That is not a reason to refuse q4; it is a reason to say what it is for. At
+1.57 GiB it puts this checkpoint on a machine that could not hold it at all,
+and for open-ended prose it reads the same. For quoting a document back exactly
+it is the wrong format, and that should be a choice the caller makes knowing
+the number.
+
+### That the obvious remedy does not work
+
+Sparing the output head is what is usually done, and here the head is tied to
+the embedding and is 262M of 2.69B — 1.57 GiB becomes 1.69 GiB. Measured, it is
+**worse on both texts**: prose 35.892 to 38.339, licence 3.5401 to 3.8450. It
+is in the refusal register with those numbers and no explanation, because none
+was established. Somebody will think of it again; this is so they measure it
+rather than assume it.
+
+### Code
+
+`app/core.c`: `ILL_TYPE_Q4` with its name and size, `ill_q4_pack` and
+`ill_q4_lift` in part 5, `ill_q4_open` and `ill_q4_dot` beside the q8 pair,
+`ill_dense_nib` in part 8, a `ILL_TYPE_Q4` arm in `ill_plane_row`,
+`ill_model_pack` taking the format it is packing into, and the dense dispatch.
+`app/main.c`: `--quant q4`.
+
+### Tests
+
+The dense sweep at every tile width against the same independent f32
+restatement the q8 sweep uses, at eight times q8's tolerance because four bits
+is about eight times its step; a row read back agreeing with what the dot is
+using; that a value comes back within half a step and a step is the peak over
+eight, which is what placing the extreme on -8 buys; and that the register lift
+and the byte lift agree, compared through the dot because the register form has
+no bytes to look at.
+
+They bite. Dividing the peak by seven and clipping fails the half-step check at
+0.857 against 0.813. Swapping the halves of the register lift fails nine
+checks. Biasing the byte lift by one fails three — but only on `--no-simd`,
+where that code is live at all; on a machine with vectors it is not compiled,
+which is the reason the suite runs that flavour.
+
+The reference harness gains `storage/q4_repack` beside the q8 one: top-1 100%,
+correlation 0.9906 against `transformers`, where q8 reaches 0.9999. The bar
+there is deliberately loose, because that check is for catching a packing bug —
+what the format costs is a perplexity number and is taken above.
+
+**119 pass**, 108 before, and 25 in the reference harness, 24 before.

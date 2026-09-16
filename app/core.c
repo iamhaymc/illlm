@@ -96,6 +96,7 @@ typedef enum IllType {
     ILL_TYPE_F16,
     ILL_TYPE_BF16,
     ILL_TYPE_Q8,        /* 32 value blocks, one f32 scale per block         */
+    ILL_TYPE_Q4,        /* the same blocks at half the width, two to a byte */
     ILL_TYPE_COUNT
 } IllType;
 
@@ -135,7 +136,7 @@ typedef struct IllArch {
 
 typedef struct IllPlan {
     const char *model_path;    /* checkpoint folder, or a .safetensors file */
-    IllType     weight_type;   /* ILL_TYPE_KEEP or ILL_TYPE_Q8              */
+    IllType     weight_type;   /* ILL_TYPE_KEEP, ILL_TYPE_Q8 or ILL_TYPE_Q4 */
     const char *backend_name;  /* NULL selects the default backend          */
     int32_t     thread_count;  /* 0 asks the platform for a sensible count  */
     int32_t     batch_span;    /* prefill chunk in tokens, 0 picks 256      */
@@ -828,6 +829,7 @@ const char *ill_type_text(IllType type)
         case ILL_TYPE_F16:  return "f16";
         case ILL_TYPE_BF16: return "bf16";
         case ILL_TYPE_Q8:   return "q8";
+        case ILL_TYPE_Q4:   return "q4";
         default:            return "?";
     }
 }
@@ -839,6 +841,7 @@ size_t ill_type_size(IllType type, size_t count)
         case ILL_TYPE_F16:
         case ILL_TYPE_BF16: return count * 2;
         case ILL_TYPE_Q8:   return count;   /* scales are held separately */
+        case ILL_TYPE_Q4:   return (count + 1) / 2;
         default:            return 0;
     }
 }
@@ -1113,6 +1116,104 @@ static void ill_q8_pack(const float *src, int32_t count, int8_t *quant, float *s
 }
 
 
+/* -- q4 --------------------------------------------------------------------
+ *
+ * The same 32 value block as q8 with the values at half the width, two to a
+ * byte: sixteen bytes and one f32 scale where q8 spends thirty-two and one.
+ * That is 20 bytes a block against 36, so a checkpoint reads 0.56 of what it
+ * read at q8, and decode is bytes over bandwidth.
+ *
+ * All sixteen levels are used by placing the block's largest value exactly on
+ * -8.  The two obvious alternatives each give something up: dividing the
+ * magnitude by 8 and clipping hands the peak back at seven eighths of itself,
+ * and dividing by 7 keeps the peak but widens every step by a seventh, so
+ * every other value in the block is quantised more coarsely for nothing.  The
+ * scale therefore carries a sign, which costs nothing -- it is a float
+ * multiply at the end of a row.
+ *
+ * Within a block the low nibbles of the sixteen bytes hold values 0..15 and
+ * the high nibbles hold 16..31, so lifting a block is sixteen reads rather
+ * than a stride of two through it.
+ * ------------------------------------------------------------------------*/
+
+#define ILL_Q4_BYTES 16   /* packed bytes per block */
+
+/* Quantises one row of f32 into packed nibbles plus per-block scales. */
+static void ill_q4_pack(const float *src, int32_t count, uint8_t *quant, float *scale)
+{
+    int32_t base;
+    for (base = 0; base < count; base += ILL_Q8_BLOCK) {
+        int32_t      span = ILL_MIN(ILL_Q8_BLOCK, count - base);
+        const float *cell = src + base;
+        uint8_t     *dest = quant + (size_t)(base / ILL_Q8_BLOCK) * ILL_Q4_BYTES;
+        float        peak = 0.0f, far = 0.0f, step, back;
+        int32_t      slot;
+        /* The extreme value with its sign, so it lands on -8 exactly. */
+        for (slot = 0; slot < span; ++slot) {
+            float mag = cell[slot] < 0.0f ? -cell[slot] : cell[slot];
+            if (mag > peak) { peak = mag; far = cell[slot]; }
+        }
+        step = far / -8.0f;
+        back = step != 0.0f ? 1.0f / step : 0.0f;
+        scale[base / ILL_Q8_BLOCK] = step;
+        for (slot = 0; slot < ILL_Q8_BLOCK; ++slot) {
+            int32_t cast = 8;                     /* the code for zero */
+            if (slot < span) {
+                float tick = cell[slot] * back;
+                float snap = tick + (tick < 0.0f ? -0.5f : 0.5f);
+                cast = (int32_t)snap + 8;
+                cast = cast > 15 ? 15 : cast;
+                cast = cast <  0 ?  0 : cast;
+            }
+            if (slot < ILL_Q4_BYTES) dest[slot] = (uint8_t)cast;
+            else dest[slot - ILL_Q4_BYTES] |= (uint8_t)(cast << 4);
+        }
+    }
+}
+
+/* Expands one packed block into 32 signed bytes, which is what the q8 dot
+ * products already know how to read.
+ *
+ * This is the form that writes to memory, and it is used where the caller
+ * wants bytes -- reading a row back, and the ragged block at the end of one.
+ * The dot product does not use it: on any machine with vectors the hot path is
+ * `ill_q4_open`, which lifts into a register and never stores.  That
+ * distinction is not a nicety.  Written as sixteen scalar iterations this cost
+ * about thirty times the dot product it fed and q4 decoded seven times slower
+ * than q8 while reading half the bytes; vectorised but still going through a
+ * buffer it was 1.8x slower; only lifting into the register the dot reads did
+ * the format start to pay.  The five instructions are the same either way:
+ * mask the low nibbles, shift and mask the high ones, put the two halves side
+ * by side, and subtract the bias that makes 0..15 into -8..7. */
+#if defined(ILL_ARCH_X86) && (defined(__AVX2__) || defined(__AVX512F__)) && !defined(ILL_NO_SIMD)
+static inline void ill_q4_lift(const uint8_t *packed, int8_t *out)
+{
+    __m128i raw  = _mm_loadu_si128((const __m128i *)packed);
+    __m128i lo   = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+    __m128i hi   = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+    __m256i both = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+    _mm256_storeu_si256((__m256i *)out, _mm256_sub_epi8(both, _mm256_set1_epi8(8)));
+}
+#elif defined(ILL_ARCH_ARM) && defined(__ARM_NEON) && !defined(ILL_NO_SIMD)
+static inline void ill_q4_lift(const uint8_t *packed, int8_t *out)
+{
+    uint8x16_t raw = vld1q_u8(packed);
+    uint8x16_t lo  = vandq_u8(raw, vdupq_n_u8(0x0Fu));
+    uint8x16_t hi  = vshrq_n_u8(raw, 4);
+    vst1q_s8(out, vsubq_s8(vreinterpretq_s8_u8(lo), vdupq_n_s8(8)));
+    vst1q_s8(out + ILL_Q4_BYTES, vsubq_s8(vreinterpretq_s8_u8(hi), vdupq_n_s8(8)));
+}
+#else
+static inline void ill_q4_lift(const uint8_t *packed, int8_t *out)
+{
+    int32_t k;
+    for (k = 0; k < ILL_Q4_BYTES; ++k) {
+        out[k]                = (int8_t)((int32_t)(packed[k] & 0x0Fu) - 8);
+        out[k + ILL_Q4_BYTES] = (int8_t)((int32_t)(packed[k] >> 4) - 8);
+    }
+}
+#endif
+
 /* -- q8 dot ----------------------------------------------------------------
  *
  * One block is 32 signed bytes with an f32 scale on each side.  Integer
@@ -1223,10 +1324,15 @@ static inline IllQAcc ill_q8_step(IllQAcc acc, const int8_t *w, const int8_t *a,
 #if defined(ILL_ARCH_X86) && defined(__AVX512VNNI__) && defined(__AVX512BW__) && \
     defined(__AVX512F__) && !defined(ILL_NO_SIMD)
 #define ILL_Q8_PAIR 1
-static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
-                                  float lo, float hi)
+#define ILL_Q4_WIDE 1
+/* The dot over two blocks whose sixty-four weights are already in a register.
+ * q8 loads them; q4 unpacks them, and unpacking straight into a register is
+ * the difference between the format paying and not -- lifted through a
+ * sixty-four byte buffer instead, the store and the reload cost more than the
+ * halved weight read saves. */
+static inline IllQAcc ill_q8_pair_wide(IllQAcc acc, __m512i wv, const int8_t *a,
+                                       float lo, float hi)
 {
-    __m512i wv  = _mm512_loadu_si512((const void *)w);
     __m512i av  = _mm512_loadu_si512((const void *)a);
     __mmask64 neg = _mm512_movepi8_mask(wv);               /* where w is negative */
     __m512i mag = _mm512_abs_epi8(wv);                     /* |w|, read unsigned  */
@@ -1235,6 +1341,12 @@ static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
     __m512  sv  = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(lo)),
                                      _mm256_set1_ps(hi), 1);
     return _mm512_fmadd_ps(_mm512_cvtepi32_ps(tot), sv, acc);
+}
+
+static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
+                                  float lo, float hi)
+{
+    return ill_q8_pair_wide(acc, _mm512_loadu_si512((const void *)w), a, lo, hi);
 }
 #endif
 
@@ -1246,6 +1358,50 @@ static inline IllQAcc ill_q8_pair(IllQAcc acc, const int8_t *w, const int8_t *a,
     return ill_q8_step(acc, w + ILL_Q8_BLOCK, a + ILL_Q8_BLOCK, hi);
 }
 #endif
+
+#if defined(ILL_Q4_WIDE)
+typedef __m512i IllQNib;
+
+/* Two packed blocks -- thirty-two bytes -- lifted into sixty-four signed
+ * weights without touching memory.  The low nibbles of a block hold its first
+ * sixteen values and the high nibbles its last sixteen, so the two halves of
+ * each block have to be interleaved back at 128 bit granularity, which is what
+ * the qword permute does. */
+static inline IllQNib ill_q4_open(const uint8_t *packed)
+{
+    __m256i raw = _mm256_loadu_si256((const __m256i *)packed);
+    __m256i lo  = _mm256_and_si256(raw, _mm256_set1_epi8(0x0F));
+    __m256i hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), _mm256_set1_epi8(0x0F));
+    __m512i idx = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+    __m512i nib = _mm512_permutex2var_epi64(_mm512_castsi256_si512(lo), idx,
+                                            _mm512_castsi256_si512(hi));
+    return _mm512_sub_epi8(nib, _mm512_set1_epi8(8));
+}
+
+static inline IllQAcc ill_q4_dot(IllQAcc acc, IllQNib w, const int8_t *a,
+                                 float lo, float hi)
+{
+    return ill_q8_pair_wide(acc, w, a, lo, hi);
+}
+#else
+/* Everywhere else the lift goes through a buffer and the q8 pair reads it. */
+typedef struct IllQNib { int8_t cell[2 * ILL_Q8_BLOCK]; } IllQNib;
+
+static inline IllQNib ill_q4_open(const uint8_t *packed)
+{
+    IllQNib nib;
+    ill_q4_lift(packed, nib.cell);
+    ill_q4_lift(packed + ILL_Q4_BYTES, nib.cell + ILL_Q8_BLOCK);
+    return nib;
+}
+
+static inline IllQAcc ill_q4_dot(IllQAcc acc, IllQNib w, const int8_t *a,
+                                 float lo, float hi)
+{
+    return ill_q8_pair(acc, w.cell, a, lo, hi);
+}
+#endif
+
 
 /* ============================================================================
  * part 6 -- json reader
@@ -2003,6 +2159,76 @@ static void ill_dense_byte(const IllPlane *plane, const int8_t *xq, size_t qstep
     }
 }
 
+/* -- dense with q4 weights -------------------------------------------------
+ *
+ * The activations are still q8: the saving is in the weights, which are what a
+ * decode step reads.  A block pair is lifted once into signed bytes and then
+ * fused against every activation row in the tile, so the unpacking is paid
+ * once per weight rather than once per weight per token.
+ * ------------------------------------------------------------------------*/
+
+#define ILL_DENSE_Q4_BODY(N)                                                          \
+    do {                                                                              \
+        int32_t r;                                                                    \
+        for (r = r0; r < r1; ++r) {                                                   \
+            const uint8_t *w  = (const uint8_t *)plane->cells +                       \
+                                (size_t)r * (size_t)blocks * ILL_Q4_BYTES;            \
+            const float   *ws = plane->steps + (size_t)r * (size_t)blocks;            \
+            int8_t  lift[2 * ILL_Q8_BLOCK];                                           \
+            IllQAcc acc[N];                                                           \
+            int32_t t, b;                                                             \
+            for (t = 0; t < N; ++t) acc[t] = ill_q8_zero();                           \
+            for (b = 0; b + 2 <= full; b += 2) {                                      \
+                IllQNib wide = ill_q4_open(w + (size_t)b * ILL_Q4_BYTES);             \
+                for (t = 0; t < N; ++t)                                               \
+                    acc[t] = ill_q4_dot(acc[t], wide,                                 \
+                                xq + (size_t)t * qstep + (size_t)b * ILL_Q8_BLOCK,    \
+                                ws[b] * xs[(size_t)t * sstep + b],                    \
+                                ws[b + 1] * xs[(size_t)t * sstep + b + 1]);           \
+            }                                                                         \
+            for (; b < full; ++b) {                                                   \
+                ill_q4_lift(w + (size_t)b * ILL_Q4_BYTES, lift);                      \
+                for (t = 0; t < N; ++t)                                               \
+                    acc[t] = ill_q8_step(acc[t],                                      \
+                                lift, xq + (size_t)t * qstep + (size_t)b * ILL_Q8_BLOCK, \
+                                ws[b] * xs[(size_t)t * sstep + b]);                   \
+            }                                                                         \
+            for (t = 0; t < N; ++t) {                                                 \
+                float sum = ill_q8_fold(acc[t]);                                      \
+                for (b = full; b < blocks; ++b) {                                     \
+                    int32_t base = b * ILL_Q8_BLOCK;                                  \
+                    int32_t span = ILL_MIN(ILL_Q8_BLOCK, cols - base);                \
+                    int32_t tot = 0, slot;                                            \
+                    ill_q4_lift(w + (size_t)b * ILL_Q4_BYTES, lift);                  \
+                    for (slot = 0; slot < span; ++slot)                               \
+                        tot += (int32_t)lift[slot] *                                  \
+                               (int32_t)xq[(size_t)t * qstep + base + slot];          \
+                    sum += (float)tot * ws[b] * xs[(size_t)t * sstep + b];            \
+                }                                                                     \
+                y[(size_t)t * ystep + r] = sum;                                       \
+            }                                                                         \
+        }                                                                             \
+    } while (0)
+
+static void ill_dense_nib(const IllPlane *plane, const int8_t *xq, size_t qstep,
+                          const float *xs, size_t sstep, int32_t tiles,
+                          int32_t r0, int32_t r1, float *y, size_t ystep)
+{
+    const int32_t cols   = plane->cols;
+    const int32_t blocks = plane->blocks;
+    const int32_t full   = cols / ILL_Q8_BLOCK;   /* whole blocks only */
+    switch (tiles) {
+        case 1:  ILL_DENSE_Q4_BODY(1); break;
+        case 2:  ILL_DENSE_Q4_BODY(2); break;
+        case 3:  ILL_DENSE_Q4_BODY(3); break;
+        case 4:  ILL_DENSE_Q4_BODY(4); break;
+        case 5:  ILL_DENSE_Q4_BODY(5); break;
+        case 6:  ILL_DENSE_Q4_BODY(6); break;
+        case 7:  ILL_DENSE_Q4_BODY(7); break;
+        default: ILL_DENSE_Q4_BODY(8); break;
+    }
+}
+
 /* -- elementwise stages --------------------------------------------------- */
 
 /* rms norm over `width`, matching the reference: reduce in f32, scale, gain. */
@@ -2106,6 +2332,20 @@ static void ill_plane_row(const IllPlane *plane, int32_t row, float *dst)
             const int8_t *w  = (const int8_t *)plane->cells + (size_t)row * cols;
             const float  *ws = plane->steps + (size_t)row * plane->blocks;
             for (j = 0; j < cols; ++j) dst[j] = (float)w[j] * ws[j / ILL_Q8_BLOCK];
+            break;
+        }
+        case ILL_TYPE_Q4: {
+            const uint8_t *w = (const uint8_t *)plane->cells +
+                               (size_t)row * (size_t)plane->blocks * ILL_Q4_BYTES;
+            const float   *ws = plane->steps + (size_t)row * plane->blocks;
+            int8_t lift[ILL_Q8_BLOCK];
+            int32_t b;
+            for (b = 0; b < plane->blocks; ++b) {
+                int32_t base = b * ILL_Q8_BLOCK;
+                int32_t span = ILL_MIN(ILL_Q8_BLOCK, cols - base);
+                ill_q4_lift(w + (size_t)b * ILL_Q4_BYTES, lift);
+                for (j = 0; j < span; ++j) dst[base + j] = (float)lift[j] * ws[b];
+            }
             break;
         }
         default: memset(dst, 0, (size_t)cols * sizeof(float)); break;
@@ -2229,6 +2469,11 @@ static void ill_cpu_dense_chore(void *args, int32_t chunk, int32_t chunks, int32
                            job->steps + (size_t)tile * pl->blocks, (size_t)pl->blocks,
                            span, r0, r1, job->dst + (size_t)tile * pl->rows,
                            (size_t)pl->rows);
+        else if (pl->type == ILL_TYPE_Q4)
+            ill_dense_nib(pl, job->quant + (size_t)tile * pl->cols, (size_t)pl->cols,
+                          job->steps + (size_t)tile * pl->blocks, (size_t)pl->blocks,
+                          span, r0, r1, job->dst + (size_t)tile * pl->rows,
+                          (size_t)pl->rows);
         else
             ill_dense_real(pl, job->src + (size_t)tile * pl->cols, (size_t)pl->cols,
                            span, r0, r1, job->dst + (size_t)tile * pl->rows,
@@ -2255,7 +2500,7 @@ static void ill_cpu_dense(IllBackend *self, const IllPlane *plane, const float *
     job.quant  = NULL;
     job.steps  = NULL;
 
-    if (plane->type == ILL_TYPE_Q8) {
+    if (plane->type == ILL_TYPE_Q8 || plane->type == ILL_TYPE_Q4) {
         int32_t row;
         for (row = 0; row < tokens; ++row)
             ill_q8_pack(src + (size_t)row * plane->cols, plane->cols,
@@ -2588,9 +2833,10 @@ static const float *ill_model_vec(IllModel *model, const IllSlab *slab, int32_t 
 
 typedef struct IllPackArgs {
     const IllPlane *from;
-    int8_t         *quant;
+    void           *quant;
     float          *steps;
     int32_t         blocks;
+    IllType         into;
 } IllPackArgs;
 
 static void ill_model_pack_chore(void *args, int32_t chunk, int32_t chunks, int32_t worker)
@@ -2606,29 +2852,38 @@ static void ill_model_pack_chore(void *args, int32_t chunk, int32_t chunks, int3
     if (!row) return;
     for (r = r0; r < r1; ++r) {
         ill_plane_row(from, r, row);
-        ill_q8_pack(row, from->cols,
-                    job->quant + (size_t)r * from->cols,
-                    job->steps + (size_t)r * job->blocks);
+        if (job->into == ILL_TYPE_Q4)
+            ill_q4_pack(row, from->cols,
+                        (uint8_t *)job->quant + (size_t)r * (size_t)job->blocks * ILL_Q4_BYTES,
+                        job->steps + (size_t)r * job->blocks);
+        else
+            ill_q8_pack(row, from->cols,
+                        (int8_t *)job->quant + (size_t)r * from->cols,
+                        job->steps + (size_t)r * job->blocks);
     }
     ill_block_free(row);
 }
 
-/* Rewrites a plane into q8 in freshly owned memory. */
-static IllResult ill_model_pack(IllModel *model, IllPlane *plane)
+/* Rewrites a plane into a block format in freshly owned memory. */
+static IllResult ill_model_pack(IllModel *model, IllPlane *plane, IllType into)
 {
     IllPlane    from = *plane;
     IllPackArgs job;
     IllCpu     *cpu  = (IllCpu *)model->backend->inner;
     int32_t     blocks = ill_q8_blocks(from.cols);
-    int8_t     *quant;
+    size_t      width = into == ILL_TYPE_Q4
+                      ? (size_t)blocks * ILL_Q4_BYTES     /* padded to whole blocks */
+                      : (size_t)from.cols;
+    void       *quant;
     float      *steps;
 
-    quant = (int8_t *)ill_block_make((size_t)from.rows * from.cols);
+    quant = ill_block_make((size_t)from.rows * width);
     steps = (float *)ill_block_make((size_t)from.rows * blocks * sizeof(float));
     if (!quant || !steps) { ill_block_free(quant); ill_block_free(steps); return ILL_ALLOC; }
     if (!ill_model_own(model, quant) || !ill_model_own(model, steps)) return ILL_ALLOC;
 
-    job.from = &from; job.quant = quant; job.steps = steps; job.blocks = blocks;
+    job.from = &from; job.quant = quant; job.steps = steps;
+    job.blocks = blocks; job.into = into;
     if (model->backend == &ill_backend_cpu && cpu)
         ill_pool_fork(cpu->pool, ill_model_pack_chore, &job, cpu->lanes);
     else
@@ -2636,9 +2891,10 @@ static IllResult ill_model_pack(IllModel *model, IllPlane *plane)
 
     plane->cells  = quant;
     plane->steps  = steps;
-    plane->type   = ILL_TYPE_Q8;
+    plane->type   = into;
     plane->blocks = blocks;
-    model->bytes += (size_t)from.rows * from.cols + (size_t)from.rows * blocks * sizeof(float);
+    model->bytes += (size_t)from.rows * width +
+                    (size_t)from.rows * blocks * sizeof(float);
     return ILL_OK;
 }
 
@@ -2660,9 +2916,9 @@ static IllResult ill_model_plane(IllModel *model, IllPlane *plane, const IllSlab
     plane->cols   = (int32_t)slab->dims[1];
     plane->blocks = 0;
     model->bytes += slab->bytes;
-    if (model->weight_type == ILL_TYPE_Q8) {
+    if (model->weight_type == ILL_TYPE_Q8 || model->weight_type == ILL_TYPE_Q4) {
         model->bytes -= slab->bytes;
-        return ill_model_pack(model, plane);
+        return ill_model_pack(model, plane, model->weight_type);
     }
     return ILL_OK;
 }
@@ -2792,7 +3048,9 @@ IllResult ill_model_load(IllModel **out, const IllPlan *plan)
 
     model = (IllModel *)ill_block_zero(sizeof(IllModel));
     if (!model) return ILL_ALLOC;
-    model->weight_type = plan->weight_type == ILL_TYPE_Q8 ? ILL_TYPE_Q8 : ILL_TYPE_KEEP;
+    model->weight_type = (plan->weight_type == ILL_TYPE_Q8 ||
+                          plan->weight_type == ILL_TYPE_Q4)
+                       ? plan->weight_type : ILL_TYPE_KEEP;
     model->batch_span  = plan->batch_span > 0 ? plan->batch_span : 256;
     arch = &model->arch;
 
@@ -2958,7 +3216,8 @@ IllResult ill_model_load(IllModel **out, const IllPlan *plan)
              arch->inner_dim, arch->head_count, arch->group_count, arch->head_dim,
              arch->vocab_size);
     ill_note(2, "weights: %s, %.2f GiB resident, backend %s/%s, %d threads",
-             model->weight_type == ILL_TYPE_Q8 ? "q8" : "as stored",
+             model->weight_type == ILL_TYPE_KEEP ? "as stored"
+                                                 : ill_type_text(model->weight_type),
              (double)model->bytes / 1073741824.0, model->backend->name, ILL_SIMD_NAME,
              model->backend->width(model->backend));
 
@@ -3112,7 +3371,7 @@ IllResult ill_state_make(IllState **out, IllModel *model, int32_t span)
     ILL_CLAIM(gate, (size_t)state->batch * arch->inner_dim);
     ILL_CLAIM(rise, (size_t)state->batch * arch->inner_dim);
 
-    if (model->weight_type == ILL_TYPE_Q8) {
+    if (model->weight_type == ILL_TYPE_Q8 || model->weight_type == ILL_TYPE_Q4) {
         state->pad.rows  = state->batch;
         state->pad.cols  = wide;
         state->pad.quant = (int8_t *)ill_state_own(state, (size_t)state->batch * wide);

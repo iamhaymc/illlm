@@ -71,7 +71,7 @@ static void app_help(void)
 "\n"
 "model options\n"
 "  --model PATH          checkpoint folder (required)\n"
-"  --quant q8|none       repack weights to q8 at load (default none)\n"
+"  --quant q8|q4|none    repack weights to q8 or q4 at load (default none)\n"
 "  --threads N           worker threads (default: host cpu count)\n"
 "  --ctx N               context window in tokens (default 4096)\n"
 "  --batch N             prefill chunk in tokens (default 256)\n"
@@ -127,7 +127,8 @@ static int app_opts_read(AppOpts *opts, int argc, char **argv, int from)
         else if (APP_TAKE("--repeat-span")) opts->tuning.repeat_span = atoi(next);
         else if (APP_TAKE("--seed"))        opts->tuning.seed = strtoull(next, NULL, 10);
         else if (APP_TAKE("--quant"))       opts->weight_type =
-                                              !strcmp(next, "q8") ? ILL_TYPE_Q8 : ILL_TYPE_KEEP;
+                                              !strcmp(next, "q8") ? ILL_TYPE_Q8 :
+                                              !strcmp(next, "q4") ? ILL_TYPE_Q4 : ILL_TYPE_KEEP;
         else if (APP_TAKE("--prefill"))     opts->prefill_span = atoi(next);
         else if (!strcmp(flag, "--every"))  opts->every_logit = 1;
         else if (!strcmp(flag, "--stream")) opts->stream_mode = 1;
@@ -930,7 +931,8 @@ static int app_do_perplexity(const AppOpts *opts)
     }
 
     printf("tokens    %d scored of %d\n", scored, feed.count);
-    printf("weights   %s\n", opts->weight_type == ILL_TYPE_Q8 ? "q8" : "as stored");
+    printf("weights   %s\n", opts->weight_type == ILL_TYPE_KEEP
+                             ? "as stored" : ill_type_text(opts->weight_type));
     printf("nll       %.4f nats a token\n", total / (double)scored);
     printf("bits      %.4f a token\n", total / (double)scored / log(2.0));
     printf("perplexity %.4f\n", exp(total / (double)scored));
@@ -986,7 +988,8 @@ static int app_do_bench(const AppOpts *opts)
     step_secs = ill_clock_now() - mark;
 
     printf("weights   %.2f GiB (%s)\n", (double)ill_model_bytes(model) / 1073741824.0,
-           opts->weight_type == ILL_TYPE_Q8 ? "q8" : "as stored");
+           opts->weight_type == ILL_TYPE_KEEP ? "as stored"
+                                              : ill_type_text(opts->weight_type));
     printf("state     %.2f GiB for %d tokens\n",
            (double)ill_state_bytes(state) / 1073741824.0, opts->context_span);
     printf("backend   %s / %s, %d threads\n", ill_model_backend(model),
