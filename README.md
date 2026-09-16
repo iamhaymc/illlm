@@ -17,8 +17,8 @@ It supports Huggingface checkpoints for:
 - Gemma4 model architecture
 - YOLO26 model architecture
 
-Written in pure and optimized C11.
-Designed to easily swap accelerators.
+It is written in pure and optimized C11,
+cross-platform, and designed for acceleration.
 
 ## ↘️✴️ QUICKSTART
 
