@@ -9,7 +9,7 @@ Nothing here shall be edited after initial construction.
 create a high quality engine that is capable of performing inference very efficiently for the Liquid language architecture.
 
 It should use pre-trained weights provided in the huggingface transformer format:
-- https://huggingface.co/LiquidAI/LFM2.5-2.6B
+- https://huggingface.co/LiquidAI/lfm2.5-2.6b-a
 
 The implementation should be written in pure C, cross-platform, and without dependencies.
 

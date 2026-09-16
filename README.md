@@ -19,7 +19,7 @@ It runs Hugging Face checkpoints directly (included in the repository).
 ```sh
 python3 util/make.py build                             # a few seconds, no dependencies
 ./build/app_main info      --model ckpt/lfm2.5-0.4b
-./build/app_main generate  --model ckpt/lfm2.5-2.6b --prompt "Write a haiku about rivers."
+./build/app_main generate  --model ckpt/lfm2.5-2.6b-a --prompt "Write a haiku about rivers."
 ./build/app_main chat      --model ckpt/lfm2.5-0.4b
 ```
 
@@ -28,14 +28,14 @@ Add `--threads N` to pick a worker count; the default is the host's core count.
 
 ```sh
 python3 util/make.py test                              # unit tests plus reference comparison
-python3 util/make.py bench --model path/to/LFM2.5-2.6B # prefill and decode throughput
+python3 util/make.py bench --model path/to/lfm2.5-2.6b-a # prefill and decode throughput
 python3 util/make.py run -- generate --model DIR --prompt "hello"
 ```
 
 `make.py test` needs `torch` and `transformers`, which `python3 util/make.py install`
 provides. The engine itself has no dependencies at all. The published
 checkpoints ship in `ckpt/` — `ckpt/lfm2.5-0.4b` (LFM2.5-350M), `ckpt/lfm2.5-1.2b-i`
-(LFM2.5-1.2B-Instruct), and `ckpt/lfm2.5-2.6b` (LFM2.5-2.6B) — so the checkpoint
+(LFM2.5-1.2B-Instruct), and `ckpt/lfm2.5-2.6b-a` (LFM2.5-2.6B) — so the checkpoint
 suite — logits, tokenizer, throughput, and greedy behaviour against the
 reference — runs by default against `ckpt/lfm2.5-0.4b`; `--no-checkpoint` skips it,
 and `--model PATH` points somewhere else.
@@ -57,7 +57,7 @@ IllState *state;
 float *logits;
 
 ill_plan_init(&plan);
-plan.model_path = "path/to/LFM2.5-2.6B";
+plan.model_path = "path/to/lfm2.5-2.6b-a";
 ill_model_load(&model, &plan);
 ill_state_make(&state, model, 4096);
 
@@ -206,10 +206,10 @@ line — which is the only part of this that needs installing:
 
 ```sh
 pip install -e .                                  # lighteval and langdetect
-python3 util/eval.py --model ckpt/lfm2.5-2.6b            # the nine benchmarks
-python3 util/eval.py --model ckpt/lfm2.5-2.6b --samples 200   # a longer run
-python3 util/eval.py --tasks ifeval,boolq --model ckpt/lfm2.5-2.6b
-python3 util/eval.py --model ckpt/lfm2.5-2.6b --rival hf-inference-providers/Qwen/Qwen3-4B
+python3 util/eval.py --model ckpt/lfm2.5-2.6b-a            # the nine benchmarks
+python3 util/eval.py --model ckpt/lfm2.5-2.6b-a --samples 200   # a longer run
+python3 util/eval.py --tasks ifeval,boolq --model ckpt/lfm2.5-2.6b-a
+python3 util/eval.py --model ckpt/lfm2.5-2.6b-a --rival hf-inference-providers/Qwen/Qwen3-4B
 python3 util/eval.py --chart                      # redraw from the last results
 ```
 

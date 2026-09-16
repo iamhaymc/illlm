@@ -1033,7 +1033,7 @@ def uncensor_argv(model_path, flag):
         request says -- and the divergence is measured at the first token of a
         thought. Closing the block in the prompt puts both back on the answer.
         No trailing newline: this checkpoint writes none, and greedy from
-        `ckpt/lfm2.5-2.6b` produces `...concisely.</think>Here are three practical tips`.
+        `ckpt/lfm2.5-2.6b-a` produces `...concisely.</think>Here are three practical tips`.
       - `--kl-divergence-scale` follows `--uncensor-kl`. The scale is the
         divergence heretic treats as typical when it balances its two
         objectives against each other; leaving it at 1.0 while exporting only

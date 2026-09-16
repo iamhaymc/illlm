@@ -5,7 +5,7 @@ Nothing here is required for the engine to run correctly today.
 
 ## Verification
 
-- Run `util/make.py test --model PATH` against the published `LiquidAI/LFM2.5-2.6B`
+- Run `util/make.py test --model PATH` against the published `LiquidAI/lfm2.5-2.6b-a`
   weights. Partly done: `info` and `generate` run against the published
   checkpoint (2.69B, 30 layers: 8 attention + 22 convolution), prefill and
   decode both produce coherent text, and the harness compares logits against

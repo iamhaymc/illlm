@@ -1,7 +1,7 @@
 ---
 license: other
-license_link: https://huggingface.co/LiquidAI/LFM2.5-2.6B/blob/main/LICENSE
-base_model: AyoubChLin/lfm2.5-2.6b-fable5-coding-agent
+license_link: https://huggingface.co/LiquidAI/lfm2.5-2.6b-a/blob/main/LICENSE
+base_model: AyoubChLin/lfm2.5-2.6b-a-fable5-coding-agent
 tags:
   - lfm2
   - heretic
@@ -25,7 +25,7 @@ pipeline_tag: text-generation
 
 <br>
 
-A decensored variant of [AyoubChLin/lfm2.5-2.6b-fable5-coding-agent](https://huggingface.co/AyoubChLin/lfm2.5-2.6b-fable5-coding-agent) (full-parameter SFT of [LiquidAI/LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B) on [saidutta69/fable-5-premium](https://huggingface.co/datasets/saidutta69/fable-5-premium)), produced with [Heretic](https://github.com/p-e-w/heretic) v1.4.0 (directional ablation / "abliteration"). Refusal behavior is suppressed via targeted weight edits to the attention output and MLP down-projections rather than fine-tuning, so the base model's coding-agent capabilities, tool-use patterns, and instruction-following are left largely intact.
+A decensored variant of [AyoubChLin/lfm2.5-2.6b-a-fable5-coding-agent](https://huggingface.co/AyoubChLin/lfm2.5-2.6b-a-fable5-coding-agent) (full-parameter SFT of [LiquidAI/lfm2.5-2.6b-a](https://huggingface.co/LiquidAI/lfm2.5-2.6b-a) on [saidutta69/fable-5-premium](https://huggingface.co/datasets/saidutta69/fable-5-premium)), produced with [Heretic](https://github.com/p-e-w/heretic) v1.4.0 (directional ablation / "abliteration"). Refusal behavior is suppressed via targeted weight edits to the attention output and MLP down-projections rather than fine-tuning, so the base model's coding-agent capabilities, tool-use patterns, and instruction-following are left largely intact.
 
 **Abliteration results:** KL divergence 0.014 · Refusals reduced from 96/100 → 7/100.
 
@@ -78,7 +78,7 @@ Full quantization set (14 quants + F16) produced with [llama.cpp](https://github
 
 LFM2 hybrid conv+attention architecture — loads natively in llama.cpp (arch `lfm2`).
 
-Run `llama serve -hf saidutta69/lfm2.5-2.6b-fable5-coding-agent-heretic` to pull the default quant.
+Run `llama serve -hf saidutta69/lfm2.5-2.6b-a-fable5-coding-agent-heretic` to pull the default quant.
 
 ## Quickstart
 
@@ -86,13 +86,13 @@ Run `llama serve -hf saidutta69/lfm2.5-2.6b-fable5-coding-agent-heretic` to pull
 
 ```bash
 # defaults to the Q4_K_M quant
-llama serve -hf saidutta69/lfm2.5-2.6b-fable5-coding-agent-heretic:Q4_K_M
+llama serve -hf saidutta69/lfm2.5-2.6b-a-fable5-coding-agent-heretic:Q4_K_M
 ```
 
 ### Ollama
 
 ```bash
-ollama run hf.co/saidutta69/lfm2.5-2.6b-fable5-coding-agent-heretic:Q4_K_M
+ollama run hf.co/saidutta69/lfm2.5-2.6b-a-fable5-coding-agent-heretic:Q4_K_M
 ```
 
 ### LM Studio
@@ -107,7 +107,7 @@ ollama run hf.co/saidutta69/lfm2.5-2.6b-fable5-coding-agent-heretic:Q4_K_M
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = "saidutta69/lfm2.5-2.6b-fable5-coding-agent-heretic"
+MODEL_ID = "saidutta69/lfm2.5-2.6b-a-fable5-coding-agent-heretic"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForCausalLM.from_pretrained(
@@ -139,4 +139,4 @@ Refusal suppression is deliberate and works as intended: this model will comply 
 
 ## License
 
-Inherits the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-2.6B/blob/main/LICENSE) from the base model.
+Inherits the [LFM Open License v1.0](https://huggingface.co/LiquidAI/lfm2.5-2.6b-a/blob/main/LICENSE) from the base model.
