@@ -688,18 +688,63 @@ static void yolo_cpu_add(const YoloBackend *backend, float *a_list,
 
 /* out[row, col] = sum_mid a[row, mid] * b[mid, col], or b[col, mid] swapped.
  *
- * The unswapped form is written as a run of scaled row adds rather than as
- * dot products: b's rows are contiguous, so the inner loop reads one stride-1
- * stream and writes another, which is what vectorises.  The swapped form has
- * no such layout and is a plain dot product; it is only reached by attention,
- * where the matrices are small. */
+ * Written as scaled row adds rather than dot products, because b's rows are
+ * contiguous and a run of `out += scale * b` reads one stride-1 stream and
+ * writes another, which is what a compiler vectorises.  The plain form of that
+ * -- one output row at a time, the whole row width -- is memory bound rather
+ * than arithmetic bound: an output row of a convolution at 160 by 160 is a
+ * hundred kilobytes, so every one of the `mid_count` passes pushes it out of
+ * the first level cache and reads it back.
+ *
+ * So the columns are cut into blocks small enough that four output rows of one
+ * block stay in the first level cache for the whole of the mid loop, and the
+ * four rows are advanced together.  That reads each element of b once and
+ * spends four multiply-adds on it rather than one.  Four is where the
+ * registers run out on a machine with sixteen of them; eight measured level
+ * and costs another eighth of the cache block.
+ *
+ * The swapped form has no such layout and stays a plain dot product; only
+ * attention reaches it, where the matrices are a few hundred wide. */
+
+#define YOLO_GEMM_BLOCK 256
+#define YOLO_GEMM_TILE 8      /* one vector's worth on anything with AVX */
+#define YOLO_GEMM_ROWS 8
+
+/* The inner kernel: four output rows by eight columns, held in registers for
+ * the whole of the mid loop.  Writing it as a fixed size array with constant
+ * loop bounds is enough for a compiler to keep it in vector registers and
+ * unroll both loops; the point is that `out` is neither loaded nor stored
+ * inside the loop, which is what the row-add form spends most of its time on. */
+static void yolo_gemm_tile(const float *a_list, const float *b_list,
+                           float *out_list, int mid_count,
+                           int a_step, int b_step, int out_step, int wide)
+{
+    float room[YOLO_GEMM_ROWS][YOLO_GEMM_TILE];
+    int mid, lane, step;
+
+    for (lane = 0; lane < YOLO_GEMM_ROWS; lane++)
+        for (step = 0; step < YOLO_GEMM_TILE; step++) room[lane][step] = 0.0f;
+
+    for (mid = 0; mid < mid_count; mid++) {
+        const float *b_row = b_list + (size_t)mid * (size_t)b_step;
+        for (lane = 0; lane < YOLO_GEMM_ROWS; lane++) {
+            float scale = a_list[(size_t)a_step * lane + mid];
+            for (step = 0; step < YOLO_GEMM_TILE; step++)
+                room[lane][step] += scale * b_row[step];
+        }
+    }
+    for (lane = 0; lane < wide; lane++)
+        for (step = 0; step < YOLO_GEMM_TILE; step++)
+            out_list[(size_t)out_step * lane + step] = room[lane][step];
+}
+
 static void yolo_cpu_gemm(const YoloBackend *backend,
                           const float *a_list, const float *b_list,
                           float *out_list,
                           int row_count, int mid_count, int col_count,
                           int a_step, int b_step, int out_step, int b_swap_flag)
 {
-    int row, mid, col;
+    int row, mid, col, block;
     (void)backend;
 
     if (b_swap_flag) {
@@ -717,16 +762,34 @@ static void yolo_cpu_gemm(const YoloBackend *backend,
         return;
     }
 
-    for (row = 0; row < row_count; row++) {
-        const float *a_row = a_list + (size_t)row * (size_t)a_step;
-        float *out_row = out_list + (size_t)row * (size_t)out_step;
-        for (col = 0; col < col_count; col++) out_row[col] = 0.0f;
-        for (mid = 0; mid < mid_count; mid++) {
-            float scale = a_row[mid];
-            const float *b_row = b_list + (size_t)mid * (size_t)b_step;
-            if (scale == 0.0f) continue;
-            for (col = 0; col < col_count; col++)
-                out_row[col] += scale * b_row[col];
+    for (block = 0; block < col_count; block += YOLO_GEMM_BLOCK) {
+        int span = yolo_min_int(YOLO_GEMM_BLOCK, col_count - block);
+        int whole = span - span % YOLO_GEMM_TILE;
+        for (row = 0; row < row_count; row += YOLO_GEMM_ROWS) {
+            int wide = yolo_min_int(YOLO_GEMM_ROWS, row_count - row);
+            const float *a_row = a_list + (size_t)row * (size_t)a_step;
+            float *out_row = out_list + (size_t)row * (size_t)out_step + block;
+            int lane;
+
+            /* a short last group reads a rows that are not there, so it takes
+             * the general path rather than a padded one */
+            if (wide == YOLO_GEMM_ROWS) {
+                for (col = 0; col < whole; col += YOLO_GEMM_TILE)
+                    yolo_gemm_tile(a_row, b_list + block + col, out_row + col,
+                                   mid_count, a_step, b_step, out_step, wide);
+            } else {
+                whole = 0;
+            }
+            for (lane = 0; lane < wide; lane++) {
+                float *tail = out_row + (size_t)out_step * lane;
+                for (col = whole; col < span; col++) tail[col] = 0.0f;
+                for (mid = 0; mid < mid_count; mid++) {
+                    float scale = a_row[(size_t)a_step * lane + mid];
+                    const float *b_row = b_list + (size_t)mid * (size_t)b_step + block;
+                    for (col = whole; col < span; col++)
+                        tail[col] += scale * b_row[col];
+                }
+            }
         }
     }
 }
