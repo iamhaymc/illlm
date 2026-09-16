@@ -16,7 +16,7 @@ It is written in pure and optimized C11,
 cross-platform, and designed for acceleration.
 
 It supports Huggingface checkpoints for:
-- LFM2.5 multi-modal architecture
+- LFM2.5 text-only architecture
 - Gemma4 multi-modal architecture
 - YOLO26 vision architecture
 
