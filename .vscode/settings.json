@@ -5,7 +5,7 @@
     "chat.useHooks": true,
     "chat.useClaudeMdFile": false,
     "chat.useClaudeHooks": false,
-    "ollama.endpoint": "http://0.0.0.0:11434",
+    "ollama.endpoint": "http://192.168.1.42:11434",
     "files.exclude": {
         "**/__pycache__": true
     }
