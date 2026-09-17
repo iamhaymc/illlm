@@ -12,16 +12,25 @@ results** before quoting a number or reopening an idea.
 
 ## 1. The files, and what each is for
 
-The source is arranged in three directories: `app/` holds the engine and its
+The source is arranged in three directories: `app/` holds the engines and the
 command line, `test/` holds the two test suites, and `util/` holds the Python
 workflows and the tune. Checkpoints live in `ckpt/`, the tuning corpus in
 `data/`.
 
+There are **two engines**, and they share nothing but the conventions in this
+file. `app/core.c` runs the Liquid text architecture from a Hugging Face
+folder; `app/yolo.c` runs yolo26 from an Ultralytics `.pt`. They are separate
+translation units with separate prefixes — `ill_` and `yolo_` — because a
+picture model and a language model have no kernel, no store and no vocabulary
+in common, and folding them together would give one file with two halves that
+never call each other.
+
 | file              | what belongs in it                                                        | what must never go in it                            |
 | ----------------- | ------------------------------------------------------------------------- | --------------------------------------------------- |
-| `app/core.c`      | the whole engine, one translation unit, fifteen layers bottom-up          | anything a second file would have to be created for |
+| `app/core.c`      | the text engine, one translation unit, fifteen layers bottom-up           | anything a second file would have to be created for |
 | `app/main.c`      | the command line front end; includes `core.c`                             | engine logic                                        |
-| `test/test.c`     | the unit tests; includes `../app/core.c`                                  | anything that needs a checkpoint it cannot make     |
+| `app/yolo.c`      | the picture engine, one translation unit, eleven layers bottom-up, with its own command line under `YOLO_MAIN` | anything the text engine also needs — copy it or leave it |
+| `test/test.c`     | the unit tests for both engines; includes `../app/core.c` and `../app/yolo.c` | anything that needs a checkpoint it cannot make     |
 | `test/test.py`    | the reference comparison against `transformers`                           | anything the C unit tests already cover             |
 | `util/make.py`    | install, build, test, run, bench, clean                                   | a second build system                               |
 | `util/tune.py`    | the tune, the caveman rule engine, and the abliteration pass              | anything the engine does at inference               |
@@ -36,8 +45,19 @@ The `.py` files are the reference comparison, the build workflow and the tune,
 not part of the engine. `util/make.py` is the only build system there is.
 
 **The file list is closed.** Do not add a source file, a header, or a build
-tool. `RESEARCH.md` used to exist and was folded into the end of `TODO.md`;
-`CHANGES.md` says so, and old citations to it by idea number still resolve.
+tool. It was opened once, at 1.7.0, for `app/yolo.c`, and the argument that
+carried it is the one to make again: a picture engine shares no kernel, no
+store and no vocabulary with a text one, so the alternative was one file with
+two halves that never call each other. Nothing smaller than a second
+architecture reopens it. `RESEARCH.md` used to exist and was folded into the
+end of `TODO.md`; `CHANGES.md` says so, and old citations to it by idea number
+still resolve.
+
+**`app/yolo.c` depends on `app/libc11/stb_image.h` and
+`app/libc11/stb_image_write.h`**, which this repository already vendors, and on
+nothing else. That is not a dependency being added — the headers are in the
+tree and no package manager is involved — and `-DYOLO_NO_STB` builds without
+them, reading and writing binary PNM only, which is what `test/test.c` does.
 
 ## 2. The versioning pattern in `CHANGES.md` — preserve it exactly
 
@@ -133,6 +153,10 @@ earlier ones.
   Name them as sentences.
 - The suite must pass on the default and `--tuned` builds; `--wide` must at
   least compile. `python util/make.py test --tuned`.
+- It must also pass on `--portable` and `--no-simd`, and the picture engine
+  must report the **same detections** under all three: its output is compared
+  against the reference to the digit, so a build flavour that moves it is a
+  bug rather than a tolerance.
 
 ## 7. Prose style
 
@@ -176,7 +200,14 @@ consistent across all of them. Match it.
 - Prepend the compiler to `PATH`, then `python util/make.py test --tuned`. There is no
   other build step.
 - Do not add dependencies. Not one, not for tests, not for tooling.
-- Generate test media rather than downloading it: the engine reads binary PNM,
+- Generate test media rather than downloading it: both engines read binary PNM,
   and Python's `wave` module writes the RIFF the audio tower wants.
+- The picture engine's parity argument is `ultralytics` itself, run out of the
+  `ckpt/yolo26/py` submodule. It is not installed by `make.py install` and is
+  not required to build or run anything; it is how a claim about matching the
+  reference is checked. **Compare on the same decoded pixels** — stb and
+  OpenCV do not agree on a JPEG to the last unit, so a comparison through
+  `.jpg` measures the two decoders as much as the engine. Write the picture out
+  as PNG or PNM first.
 - Commit messages follow the entry they describe — a title naming the change,
   then prose with the numbers in it. Doc-only commits say what moved and why.

@@ -12,24 +12,31 @@ arranged, and where to change it.
 - [7. Where the time goes](#7-where-the-time-goes)
 - [8. Extending the engine](#8-extending-the-engine)
 - [9. Naming conventions](#9-naming-conventions)
+- [10. The picture engine: inside yolo.c](#10-the-picture-engine-inside-yoloc)
 
 ---
 
 ## 1. The shape of the project
 
-Five source files, flat, no build system, plus the published checkpoints in
+Six source files, flat, no build system, plus the published checkpoints in
 `ckpt/`.
 
 | file | lines | role |
 | --- | --- | --- |
-| `app/core.c` | ~4500 | the engine: a header and its implementation in one file |
-| `app/main.c` | ~670 | the command line, six verbs |
-| `test/test.c` | ~1050 | unit tests over the engine internals |
+| `app/core.c` | ~4500 | the text engine: a header and its implementation in one file |
+| `app/main.c` | ~670 | the command line for it, six verbs |
+| `app/yolo.c` | ~4700 | the picture engine, the same way, with its own command line under `YOLO_MAIN` |
+| `test/test.c` | ~1500 | unit tests over both engines' internals |
 | `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
 | `util/tune.py` | ~1700 | fine tuning on the reference side, the caveman rule engine, and the heretic abliteration pass |
 | `data/tune.jsonl` | 202 rows | the tuning corpus |
 | `ckpt/` | — | the checkpoints; `ckpt/lfm2.5-2.6b-a` is the one this engine runs |
+
+Sections 2 through 9 are about the text engine. The picture engine has its own
+tour at the end, in section 10; it shares this file's conventions and nothing
+else, because a picture model and a language model have no kernel, no store and
+no vocabulary in common.
 
 `app/main.c` and `test/test.c` each begin with `#include "core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
@@ -635,3 +642,130 @@ They are mechanical, so the code reads at an even pace.
 
 Comments explain the decision, not the statement. If a line needs a comment to
 say what it does, it is the line that should change.
+
+
+---
+
+## 10. The picture engine: inside yolo.c
+
+`app/yolo.c` runs an Ultralytics yolo26 checkpoint as it is published. Not a
+converted one: a `.pt` is a zip holding a pickled module tree and its raw fp16
+storages, and the engine reads that directly. There is no export step, no
+second format and no Python in the path.
+
+It is the same shape as `core.c` — one translation unit, a public interface at
+the top guarded by `YOLO_INCLUDED`, everything below it private, and layers
+bottom-up where a layer may depend only on the ones beneath it. Include it to
+use it as a library; define `YOLO_MAIN` to get a command line as well.
+
+### The layers
+
+| layer | what is in it |
+| --- | --- |
+| 1 platform | status codes, the detail line, the arena, byte reads, half to float |
+| 2 planes | NCHW float planes over arena memory |
+| 3 backend | `YoloBackend`, the nine operations an accelerator would fill |
+| 4 kernels | the CPU backend: convolution, transposed convolution, pooling, resizing, activation, the matrix multiply |
+| 5 store | the zip reader, the pickle reader, and the storage table under them |
+| 6 graph | the pickled module tree turned into runnable nodes, with batch norm folded into the convolution above it |
+| 7 forward | the layer plan and the feature maps the head reads |
+| 8 head | the two detection branches, anchors, box decode, suppression, masks, keypoints |
+| 9 pictures | stb and PNM, letterboxing, lifting a result back to the source |
+| 10 api | model, options, session, result |
+| 11 cli | under `YOLO_MAIN` |
+
+### Reading the graph rather than rebuilding it
+
+The usual way to run a `.pt` outside Python is to read its `state_dict` and
+rebuild the architecture from the model's yaml, applying the depth and width
+scale table for the size letter. This engine does not. **Every module in a
+torch checkpoint already carries its class name, the channel counts it was
+constructed with, its kernel size, stride, padding and groups, and its `f`/`i`
+wiring** — because `torch.save` pickles the object graph, not the weights
+alone. Re-deriving that from the yaml is guesswork about a computation the
+checkpoint has already done, and it is why the nano, small and extra-large
+checkpoints all load through the same code with nothing keyed on the size.
+
+The pickle is **read, never executed**. A `GLOBAL` is a pair of names. Four of
+them mean something to a checkpoint — `collections.OrderedDict`,
+`torch._utils._rebuild_tensor_v2`, `_rebuild_parameter`, and a storage's type
+in a persistent id — and are turned into the value they stand for. Every other
+becomes an object carrying its class name and its state, which is exactly what
+the graph layer reads. Nothing constructs a class and nothing calls a function
+the file names.
+
+One rewrite happens on the way through: a convolution followed by a batch norm
+becomes one convolution with a bias, which is the identity
+
+```
+bn(conv(x)) = conv'(x),   w' = w · γ/√(σ²+ε),   b' = (b−μ)·γ/√(σ²+ε) + β
+```
+
+and is what ultralytics itself does before it predicts.
+
+### The two heads
+
+yolo26 ships two copies of its detection branches. `cv2`/`cv3` are trained one
+to many, so several cells fire on one object and suppression picks between
+them. `one2one_cv2`/`one2one_cv3` are trained one to one, so the top scoring
+cells are the answer and there is nothing to suppress — the NMS-free path the
+architecture is known for.
+
+**`yolo predict` reads the one-to-many pair unless it is told otherwise**, and
+so does this engine. `nms_free_flag` in `YoloOptions`, or `--nms-free` on the
+command line, reads the other. Both are implemented, because a parity run has
+to be able to ask for either.
+
+`reg_max` is 1 on every published yolo26, so the distribution focal layer is an
+identity and the box branch says its four distances outright. `yolo_edge_value`
+still carries the distribution form, so a v8 or v11 checkpoint loads and runs
+rather than being read wrongly and producing plausible boxes.
+
+### The seam an accelerator fills
+
+Every arithmetic the forward pass does goes through `YoloBackend`: nine
+function pointers, and a CPU table that is the reference implementation of
+them. `yolo_model_backend_set` points a model at another table. Nothing above
+layer 4 knows which one is in play, and nothing in layers 5 through 11 does
+arithmetic of its own.
+
+### Where a parity run goes wrong
+
+Three things had to be matched rather than improved on, and each of them is the
+kind of thing that looks like noise until it is not.
+
+**The letterbox pads to a stride multiple, not a square.** `yolo predict` on a
+checkpoint sets `auto=True`, so a 1280 by 720 picture becomes 640 by 384 and a
+810 by 1080 one becomes 480 by 640 with no padding at all. Padding out to a
+square changes the anchor grid, which changes every score in the last digit.
+
+**The resize is OpenCV's fixed point, not a float bilinear.** OpenCV quantises
+the two interpolation weights to 2048ths, drops four bits off each row before
+weighing it, keeps two fractional bits through the sum and rounds those away.
+Doing the arithmetic in one wider step and rounding once — which is more
+accurate — is wrong by a unit on about a tenth of the cells, and that carried
+to a hundredth of a logit at the head and a different score on a marginal
+detection.
+
+**A classifier's shaping goes through Pillow, which antialiases.** Shrinking a
+1080 pixel side to 224, Pillow weighs a five-wide window rather than the two
+nearest pixels. The two-tap resize puts the right label on `bus.jpg` with the
+wrong confidence, 0.77 where the reference says 0.52, because the aliasing it
+leaves behind is the high-frequency detail a classifier reads.
+
+There is a fourth that is not a difference of algorithm but of decoder: **stb
+and OpenCV do not agree on a JPEG to the last unit**. A parity run compares on
+the same decoded pixels — write the picture out as PNG or PNM first — or it
+measures the two decoders as much as the engine.
+
+### Naming
+
+The same rules as section 9, with `Yolo` and `yolo_` in place of `Ill` and
+`ill_`: `yolo_model_open`, `yolo_session_run`, `yolo_plane_face`,
+`yolo_frame_fit`. Field suffixes carry the same meanings — `_count` a quantity,
+`_size` a dimension, `_limit` a cap, `_list` an array, `_room` scratch, `_flag`
+a boolean, `_sheet` a weight matrix.
+
+One name is worth pointing at because it is load-bearing and not obvious: an
+**oriented** pick keeps its centre in `left`/`top` and its size in
+`right`/`bottom`, because a rotated box has no corners to put there.

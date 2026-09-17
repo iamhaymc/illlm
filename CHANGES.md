@@ -40,6 +40,22 @@ more than one token out of a read by verifying proposals in the same pass, and
 takes greedy decoding to 11.8 tok/s on work whose answer quotes its question —
 past the bare-read figure, because the read is no longer one token's.
 
+### The picture engine's parity argument
+
+`app/yolo.c` (1.7.0) is checked against `ultralytics` out of the
+`ckpt/yolo26/py` submodule, and the comparison is only meaningful on **the same
+decoded pixels**: stb and OpenCV do not agree on a JPEG to the last unit, so a
+run through a `.jpg` measures the two decoders as much as the engines. Write
+the picture out as PNG or PNM first. Chasing that difference is in the refusal
+register.
+
+Three things in the shaping had to be matched rather than improved on, and each
+is small enough to look like noise: the letterbox pads to a stride multiple and
+not to a square; the resize is OpenCV's fixed-point byte path, where rounding
+once at the end instead — which is more accurate — is wrong by a unit on a
+tenth of the cells; and a classifier's shaping goes through Pillow, which
+antialiases. Each of them moved a real detection.
+
 ### What a weight format costs
 
 Measured by `perplexity` (1.3.0) on the published 2.6B checkpoint, over two
@@ -92,6 +108,23 @@ that the next person does not have the same idea twice.
   3.8450. No account of why is offered, because none was established; what is
   established is that the obvious move does not pay here and should not be
   made again without a reason better than that it usually works.
+
+- **Reconciling stb's JPEG decoder with OpenCV's** (1.7.0). The last
+  disagreement between `app/yolo.c` and `ultralytics` on a `.jpg` is not in
+  either engine: the two decoders differ by a unit on a few percent of pixels,
+  which on bus.jpg moved a marginal detection's score from 0.534 to 0.577 while
+  every other detection stayed to the digit. Decoded through the same bytes,
+  the two engines agree exactly. There is nothing to fix on this side of it,
+  and matching a particular IDCT and chroma upsampling would be a JPEG decoder
+  written to imitate another JPEG decoder. Compare on PNG or PNM instead.
+
+- **Rounding the letterbox resize once rather than twice** (1.7.0). OpenCV's
+  byte path drops four bits off each row before it weighs them and keeps two
+  fractional bits through the sum; doing the arithmetic in one wider step and
+  rounding once at the end is strictly more accurate and is **wrong by a unit
+  on about a tenth of the cells**, which carried to a hundredth of a logit at
+  the head and a different score on a marginal detection. The engine is not
+  trying to resize well; it is trying to resize the same.
 
 - **Memoising the q8 activation pack** (1.2.0). Three planes in attention and
   two in the feed forward read the same normalised row, so the same bytes are
@@ -897,3 +930,154 @@ there is deliberately loose, because that check is for catching a packing bug �
 what the format costs is a perplexity number and is taken above.
 
 **119 pass**, 108 before, and 25 in the reference harness, 24 before.
+
+---
+
+## 1.7.0 — a second engine, for pictures
+
+This repository ran one architecture from one store. `ckpt/yolo26` has held
+twenty-five yolo26 checkpoints and a submodule of the reference implementation
+since the weights were tracked, and nothing here could read any of them. The
+usual route — export to ONNX, or convert the weights with a Python script and
+ship a second format — puts Python back in a path this project exists to keep
+it out of. So `app/yolo.c` reads the published `.pt` as it is.
+
+### What it took
+
+A `.pt` is a zip holding a pickled module tree and its raw storages. Reading it
+needs three things this file did not have: a zip directory walk, a pickle
+reader, and a way to turn the object graph into something runnable.
+
+**The graph is read, not rebuilt.** The usual way to run a checkpoint outside
+Python is to take its `state_dict` and reconstruct the architecture from the
+model's yaml, applying the depth and width scale table for the size letter.
+Every module in a torch checkpoint already carries its class name, the channel
+counts it was constructed with, its kernel size, stride, padding and groups,
+and its `f`/`i` wiring, because `torch.save` pickles the object graph rather
+than the weights alone. Re-deriving that from the yaml is guesswork about a
+computation the checkpoint has already done. It is why n, s and x load through
+the same code with nothing keyed on the size, and why the four task heads —
+`Detect`, `Segment26`, `Pose26`, `OBB26` — needed no per-task loader.
+
+**The pickle is read, never executed.** A `GLOBAL` is a pair of names. Four of
+them mean something to a checkpoint — `collections.OrderedDict`,
+`torch._utils._rebuild_tensor_v2`, `_rebuild_parameter`, and a storage's type
+in a persistent id — and become the value they stand for. Every other becomes
+an object carrying its class name and its state, which is what the graph layer
+reads. Nothing constructs a class and nothing calls a function the file names.
+An opcode outside the set is a refusal naming the opcode, not a guess.
+
+One rewrite happens at load: a convolution followed by a batch norm becomes one
+convolution with a bias, which is the identity `bn(conv(x)) = conv'(x)` and is
+what ultralytics does before it predicts.
+
+**Both heads.** yolo26 ships `cv2`/`cv3`, trained one to many and needing
+suppression, and `one2one_cv2`/`one2one_cv3`, trained one to one and needing
+none. The NMS-free head is what the architecture is known for; `yolo predict`
+reads the other one unless told otherwise, and so does this. A parity run has
+to be able to ask for either.
+
+### What it is worth
+
+Five tasks, five size letters, no conversion step, and a 4700-line translation
+unit whose only dependency is two stb headers already in the tree — and
+`-DYOLO_NO_STB` drops those for binary PNM.
+
+On `xeon-2.8`, yolo26n at 640 over bus.png, the minimum of five runs: 405 ms in
+total, of which 397 ms is the forward pass. One thread and no intrinsics. The
+matrix multiply got there in two measured steps from 1670 ms: blocking the
+columns and advancing four output rows together took it to 1032 ms, and holding
+an eight-by-eight tile of output in registers for the whole of the mid loop
+took it to 554 ms. Wider tiles were worse — six by sixteen measured 625 ms —
+which is the registers running out.
+
+`-O3` is **70% slower than `-O2`** on this file and the build says so: its loop
+vectoriser rewrites that tile and spills it. `-O3` 645 ms, `-O2` 510 ms, `-O2`
+with `-funroll-loops` 376 ms, all three producing the same numbers. `app/yolo.c`
+is compiled at the last of those and `-O3` stays everywhere else.
+
+### That it is the same answer
+
+Against `ultralytics` 8.3.222, on the same decoded pixels, every checkpoint and
+every task matches **to every digit the reference prints**: yolo26n, yolo26s
+and yolo26x-seg on bus, yolo26n on zidane through both heads, and the pose, obb
+and classify heads. Underneath that, the shaped input is bit for bit identical
+and the head's class logits agree to **1.9e-5** over every logit that can
+become a detection.
+
+Getting there meant matching three things rather than improving on them, and
+each looked like noise until it was not.
+
+The letterbox pads to a **multiple of the stride, not to a square**. `yolo
+predict` on a checkpoint sets `auto=True`, so 1280 by 720 becomes 640 by 384
+and 810 by 1080 becomes 480 by 640 with no padding at all. A square changes the
+anchor grid and every score with it.
+
+The resize is **OpenCV's fixed point**, not a float bilinear: weights quantised
+to 2048ths, four bits dropped off each row before it is weighed, two fractional
+bits through the sum and rounded away. Doing the arithmetic in one wider step
+and rounding once — which is more accurate — is wrong by a unit on a tenth of
+the cells, and that carried to a hundredth of a logit and a different score on
+a marginal detection.
+
+A classifier's shaping goes through **Pillow, which antialiases**. Shrinking a
+1080 pixel side to 224 it weighs a five-wide window, not the two nearest
+pixels. The two-tap resize put the right label on bus.png with the wrong
+confidence — minibus 0.77 against the reference's 0.52 — because the aliasing
+it leaves behind is the high-frequency detail a classifier reads.
+
+There is a fourth that is not an algorithm but a decoder: **stb and OpenCV do
+not agree on a JPEG to the last unit**. A parity run that compares through a
+`.jpg` measures the two decoders as much as the engines. Write the picture out
+as PNG or PNM first. This is in the refusal register as a thing not to chase.
+
+And one difference that is not a mistake on either side: rotated boxes are
+suppressed by a different rule to axis-aligned ones, because the reference
+suppresses them with different code. An axis-aligned box goes through
+torchvision's greedy pass, where a struck box stops striking. An oriented box
+goes through the matrix pass, where a box is struck if any higher scoring box
+overlaps it, struck or not — so a middle box takes a third down with it after
+being taken down itself. On yolo26n-obb that is two boxes reported where the
+reference reports one. The thresholds differ too: greedy strikes above the
+limit, the matrix at or above it.
+
+### Code
+
+`app/yolo.c`, new, eleven layers bottom-up: the arena and half-to-float; NCHW
+planes; `YoloBackend` and its nine operations; the CPU kernels that fill them;
+the zip, the pickle and the storage table; the graph builder with the batch
+norm fold; the layer plan and the forward pass; anchors, box decode, both
+suppression rules, masks and keypoints; pictures through stb or PNM, the two
+letterbox geometries and the lift back to the source; the public interface; and
+a command line under `YOLO_MAIN`.
+
+`util/make.py`: `app_yolo` as a third target, built with `-DYOLO_MAIN` and at
+`-O2 -funroll-loops`; a `yolo` workflow that hands arguments to it.
+`AGENTS.md`, `GUIDE.md` §10, `README.md`: the second engine, and the argument
+for opening a file list that says it is closed.
+
+### Tests
+
+`test/test.c` takes a second translation unit, built without stb because the
+tests generate their own pictures. Forty-three checks: half to float including
+the subnormals a small model is full of; the arena's mark and release, and its
+alignment; every kernel against a plain restatement of the same arithmetic; the
+two letterbox geometries including the odd gap that is the only case able to
+tell the reference's rounding from an ordinary one; the box decode at both
+`reg_max`; both overlaps; both suppression rules; the pickle reader on bytes
+written in the test; and a PNM round trip.
+
+They bite. Turning the matrix suppression back into greedy fails the matrix
+check; turning greedy into the matrix rule fails the greedy one; dropping the
+tenth the reference subtracts before rounding a pad fails the odd-gap check;
+dropping a lane from the tile kernel's store fails the multiply; flushing half
+subnormals to zero fails two of the number checks.
+
+Two things the tests found. The arena rounded every take up to a cache line and
+then handed out pointers from a malloc aligned to sixteen bytes, so the
+alignment its comment claimed was not there. And a channel's plane is a padded
+height apart, not a fitted height apart — which is only visible when there is
+padding, so bus.jpg was right and zidane.jpg came out with its colour planes
+sliding into each other.
+
+**175 pass**, 132 before.
