@@ -450,7 +450,7 @@ app_main perplexity  score a text, so an accuracy trade has a number
 `app_main help` lists every flag. Three are worth knowing:
 
 - `--quant q8` repacks at load: half the memory, roughly double the decode
-  rate. `--quant q4` halves it again for 1.23x q8's decode, at an accuracy
+  rate. `--quant q4` halves it again for 1.52x q8's decode, at an accuracy
   cost that is invisible on prose and severe on text the model is sure about.
 - `--draft N` proposes `N` tokens from the context and verifies them in the
   same pass, which is worth about a quarter on work whose answer quotes its
@@ -548,18 +548,19 @@ why q8 nearly doubles it and why threads help until bandwidth saturates.
 Prefill is arithmetic bound. `2 * parameters * tokens` FLOPs, and the tile in
 `dense` decides how close to peak you get.
 
-On the published 2.6B checkpoint at q8, four cores at 2.80 GHz, AVX-512 with
-VNNI — the `xeon-2.8` host in `CHANGES.md`'s standing results:
+On `ckpt/lfm2.5-2.6b-a`, four cores at 2.80 GHz, AVX-512 with VNNI — the
+`xeon-2.8` host in `CHANGES.md`'s standing results, quiet machine, best of two:
 
 | | weights | prefill, 256 tok | decode |
 | --- | --- | --- | --- |
-| q8 | 2.83 GiB | 32.2 tok/s | 9.7 tok/s |
-| q4 | 1.57 GiB | 30.0 tok/s | 11.9 tok/s |
+| bf16 | 5.02 GiB | 31.2 tok/s | 5.9 tok/s |
+| q8 | 2.83 GiB | 52.2 tok/s | 10.6 tok/s |
+| q4 | 1.57 GiB | 50.2 tok/s | 16.1 tok/s |
 
-Decode there is 32.5 GB/s of weight traffic against a 36.6 GB/s bare memory
-sweep — 89% of what the host can fetch, so the decode kernel has about a tenth
-left in it and everything after that has to read fewer bytes or produce more
-than one token per read. Prefill is 88 G multiply-adds a second and is bound by
+Decode there is 32.2 GB/s of weight traffic against a 36.6 GB/s bare memory
+sweep — 88% of what the host can fetch, so the decode kernel has about an
+eighth left in it and everything after that has to read fewer bytes or produce
+more than one token per read. Prefill is bound by
 instruction issue, not by memory: its weight stream is well under the sweep.
 
 If you are profiling a change, the order of what to look at is: the `dense`
@@ -595,7 +596,7 @@ vocabulary at all: q4 is the worked example — `ill_q4_pack`, a lift, its own
 dense body, and `ill_model_pack` told which format it is packing into. If the
 format is narrower than a byte, make the lift produce a register the dot reads
 rather than a buffer it reloads. That single choice is the difference between
-q4 decoding 1.23x faster than q8 and 1.8x slower; the entry for 1.6.0 has the
+q4 decoding 1.52x faster than q8; the entry for 1.6.0 has the
 three measurements.
 
 ### A new tokenizer family

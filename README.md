@@ -24,11 +24,11 @@ python3 util/make.py build                             # a few seconds, no depen
 ```
 
 Add `--quant q8` to halve the memory and roughly double decode speed, or
-`--quant q4` to halve it again — 1.57 GiB for the 2.6B, and 1.23x q8's decode.
+`--quant q4` to halve it again — 1.57 GiB for the 2.6B, and 1.52x q8's decode.
 Read what q4 costs before choosing it: on ordinary prose, nothing a perplexity
 can see; on text the model should find easy, most of its confidence. Add
 `--draft 4` to greedy decoding to verify four context-drafted tokens in each
-pass, which is worth about a quarter on work whose answer quotes its question
+pass, which is worth about a third on work whose answer quotes its question
 and costs nothing when it does not.
 Add `--threads N` to pick a worker count; the default is the host's core count.
 
@@ -116,20 +116,21 @@ UndefinedBehaviorSanitizer.
 
 ### ➖ Comparison
 
-The published `LiquidAI/LFM2.5-2.6B` checkpoint — 30 layers, 8 attention and 22
+The `ckpt/lfm2.5-2.6b-a` checkpoint — 30 layers, 8 attention and 22
 convolution, model dim 2048, feed forward 10752, 32 query heads over 8
 key-value heads, vocabulary 128000 — on four x86-64 cores at 2.80 GHz with
-AVX-512 and VNNI, at q8:
+AVX-512 and VNNI, quiet machine, best of two:
 
 |         | weights  | prefill, 256 tok | decode     |
 | ------- | -------- | ---------------- | ---------- |
-| q8      | 2.83 GiB | 32.2 tok/s       | 9.7 tok/s  |
-| q4      | 1.57 GiB | 30.0 tok/s       | 11.9 tok/s |
+| bf16    | 5.02 GiB | 31.2 tok/s       | 5.9 tok/s  |
+| q8      | 2.83 GiB | 52.2 tok/s       | 10.6 tok/s |
+| q4      | 1.57 GiB | 50.2 tok/s       | 16.1 tok/s |
 
-q8 decode on that host is 32.5 GB/s of weight traffic against a 36.6 GB/s bare
-memory sweep, which is 89% of what the machine can fetch — at q8 decode is the
+q8 decode on that host is 32.2 GB/s of weight traffic against a 36.6 GB/s bare
+memory sweep, which is 88% of what the machine can fetch — at q8 decode is the
 memory and there is little left in the kernel. q4 reads fewer bytes and comes
-off that ceiling: 20.0 GB/s, with the unpack and the dot deciding the rate
+off that ceiling: 27.1 GB/s, with the unpack and the dot deciding the rate
 instead. Prefill is arithmetic bound throughout, which is why q4 is slower at
 it than q8.
 

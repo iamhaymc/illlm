@@ -23,46 +23,73 @@ better than the machine can fetch.
 
 Decode reads every weight once a token, so its rate is bytes over what the host
 can fetch and nothing else matters much. On `xeon-2.8` the 2.6B checkpoint at
-q8 is 2.83 GiB, and decode at 10.7 tok/s is 32.5 GB/s against a 36.6 GB/s
-sweep — **89% of what the machine can deliver**. That number is why the open
+q8 is 2.83 GiB, and decode at 10.6 tok/s is 32.1 GB/s against a 36.6 GB/s
+sweep — **88% of what the machine can deliver**. That number is why the open
 work at the top of `TODO.md` is about reading fewer bytes or getting more than
-one token out of a read, and not about faster arithmetic: there is 11% left in
+one token out of a read, and not about faster arithmetic: there is 12% left in
 the kernel and the rest has to come from somewhere else.
 
-Prefill is arithmetic bound instead, and has further to go: 32.6 tok/s on the
-same host is 88 G multiply-adds a second. That is also why a narrower weight
-format helps decode and hurts prefill — q4 (1.6.0) is 1.23x on decode and
-0.93x on prefill, because unpacking is arithmetic and prefill has none to
-spare.
+Prefill is arithmetic bound instead, and has further to go: 52.2 tok/s on the
+same host. That is also why a narrower weight format helps decode and hurts
+prefill — q4 is 1.52x on decode and 0.96x on prefill, because unpacking is
+arithmetic and prefill has none to spare.
+
+The three formats on `ckpt/lfm2.5-2.6b-a`, quiet machine, best of two:
+
+| format | resident | prefill | decode |
+| --- | --- | --- | --- |
+| bf16, as stored | 5.02 GiB | 31.2 tok/s | 5.9 tok/s |
+| q8, repacked | 2.83 GiB | 52.2 tok/s | 10.6 tok/s |
+| q4, repacked | 1.57 GiB | 50.2 tok/s | **16.1 tok/s** |
 
 That ceiling is a ceiling on **reads**, not on tokens. `--draft` (1.5.0) gets
 more than one token out of a read by verifying proposals in the same pass, and
-takes greedy decoding to 11.8 tok/s on work whose answer quotes its question —
-past the bare-read figure, because the read is no longer one token's.
+is worth 1.35x end to end on work whose answer quotes its question — past the
+bare-read figure, because the read is no longer one token's. On
+`ckpt/lfm2.5-2.6b-a` at q8, greedy, 96 tokens, `--draft 4` against plain
+greedy:
+
+| work | plain | `--draft 4` | |
+| --- | --- | --- | --- |
+| quote a sentence back, then explain it | 11.17 s | 8.25 s | **1.35x** |
+| summarise a passage in its own wording | 11.69 s | 8.92 s | **1.31x** |
+| write a haiku | 7.47 s | 7.28 s | 1.03x |
+| list twenty numbers | 10.97 s | 10.73 s | 1.02x |
+
+All four continuations are byte-identical with the draft on and off, which is
+what the feature promises: it changes the rate, never the text. The gain is
+entirely in the first two — there is nothing to draft from when the answer
+shares no span with the context, and the cost of guessing wrong is a wasted
+verify, not a wrong token.
 
 ### What a weight format costs
 
-Measured by `perplexity` (1.3.0) on the published 2.6B checkpoint, over two
-unlike texts — technical prose, and licence boilerplate a model has seen many
-times:
+Measured by `perplexity` (1.3.0) on `ckpt/lfm2.5-2.6b-a`, over two unlike
+texts — technical prose, and licence boilerplate a model has seen many times:
 
-| | `GUIDE.md` prose, 2056 tokens | Apache licence, 1900 tokens |
+| | `GUIDE.md` prose, 2014 tokens | Apache licence, 1409 tokens |
 | --- | --- | --- |
-| bf16, as stored | 3.6080 nats — 36.892 | 0.6798 nats — 1.9734 |
-| q8, repacked | 3.5999 nats — 36.594 | 0.6756 nats — 1.9651 |
-| q4, repacked | 3.5805 nats — 35.892 | 1.2642 nats — **3.5401** |
+| bf16, as stored | 3.0145 nats — 20.3791 | 0.6275 nats — 1.8730 |
+| q8, repacked | 3.0063 nats — 20.2123 | 0.6226 nats — 1.8637 |
+| q4, repacked | 3.0688 nats — 21.5160 | 1.2814 nats — **3.6017** |
 
-**q8 costs nothing this measurement can see** — under a quarter of a percent on
-both, and falling the wrong way for a lossy format, so the sign is not a result
-and the size is.
+**q8 costs nothing this measurement can see** — under half a percent on both,
+and falling the wrong way for a lossy format, so the sign is not a result and
+the size is.
 
-**q4 costs nothing on the prose and most of the licence.** The prose number
-moves less than q8's did; the licence number nearly doubles, 0.68 nats a token
-to 1.26. That gap is the whole lesson: **a perplexity taken on ordinary prose
-does not see what four bits costs**, because prose is where the model is
-unsure anyway and a blurred distribution is still about as wrong. Where the
-model is confident, four bits is where the confidence goes. Judge a narrow
-format on text it should find easy.
+**q4 costs 2% on the prose and doubles the licence.** The prose number moves
+0.054 nats, 1.02x the loss; the licence number goes 0.63 nats a token to 1.28,
+**2.04x** — it doubles. That gap is the whole lesson: **a perplexity taken on
+ordinary prose does not see what four bits costs**, because prose is where the
+model is unsure anyway and a blurred distribution is still about as wrong.
+Where the model is confident, four bits is where the confidence goes. Judge a
+narrow format on text it should find easy.
+
+This is the second checkpoint to show the split, and it shows it more sharply
+than the first: the numbers below at 1.6.0 were taken on the base
+`LiquidAI/LFM2.5-2.6B`, which the repository no longer carries, and there the
+licence went 0.68 nats to 1.26 (1.86x). Two unrelated sets of weights, the
+same shape of result.
 
 ### The published checkpoint
 
@@ -89,9 +116,13 @@ that the next person does not have the same idea twice.
   on this checkpoint is tied to the embedding and is 262M of 2.69B parameters —
   1.57 GiB becomes 1.69 GiB, which is cheap. It measured **worse**, on both
   texts and by about the same margin: prose 35.892 to 38.339, licence 3.5401 to
-  3.8450. No account of why is offered, because none was established; what is
-  established is that the obvious move does not pay here and should not be
-  made again without a reason better than that it usually works.
+  3.8450. Those four numbers are the base `LiquidAI/LFM2.5-2.6B` checkpoint's,
+  which the repository no longer carries, and they are on that checkpoint's
+  scale rather than the table above — the experiment needs a build flag to
+  enable and has not been re-taken on `ckpt/lfm2.5-2.6b-a`. No account of why
+  is offered, because none was established; what is established is that the
+  obvious move did not pay there and should not be made again without a reason
+  better than that it usually works.
 
 - **Memoising the q8 activation pack** (1.2.0). Three planes in attention and
   two in the feed forward read the same normalised row, so the same bytes are

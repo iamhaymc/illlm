@@ -18,9 +18,9 @@ Everything below that is coverage, reliability and reach.
 ## Engine
 
 1. **A q4 that survives text the model is sure about.** q4 reads 0.55 of what
-   q8 reads and decodes 1.23x faster, and on ordinary prose it costs nothing a
-   perplexity can see — but on text the model should find easy it nearly
-   doubles perplexity, 0.68 nats a token to 1.26. That is where four bits over
+   q8 reads and decodes 1.52x faster, and on ordinary prose it costs nothing a
+   perplexity can see — but on text the model should find easy it doubles the
+   loss, 0.63 nats a token to 1.28. That is where four bits over
    a 32 value block goes: not into the model's uncertainty, into its
    confidence. Narrowing the block, or spending a second scale on the rows that
    matter, or an importance-weighted pack that fits where the activations
@@ -41,11 +41,11 @@ Everything below that is coverage, reliability and reach.
    design.
 
 3. **Take q4 off the kernel ceiling.** q4 decode is the first thing in this
-   engine that is not waiting on memory: 11.9 tok/s over 1.57 GiB is 20.0 GB/s
-   against a 36.6 GB/s sweep, so a third of the machine's bandwidth is idle
-   while the unpack and the dot catch up. The byte count says 1.8x and the
-   measurement says 1.23x, and the difference is all arithmetic. It is also why
-   q4 prefill is 0.93x of q8's, since prefill has no arithmetic to spare. Fewer
+   engine that is not waiting on memory: 16.1 tok/s over 1.57 GiB is 27.1 GB/s
+   against a 36.6 GB/s sweep, so a quarter of the machine's bandwidth is idle
+   while the unpack and the dot catch up. The byte count says 1.80x and the
+   measurement says 1.52x, and the difference is all arithmetic. It is also why
+   q4 prefill is 0.96x of q8's, since prefill has no arithmetic to spare. Fewer
    instructions per unpacked block is the whole of it.
 
 4. **Fuse the attention score row.** Scores are materialised per head before
