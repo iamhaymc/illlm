@@ -7,10 +7,12 @@
 </tbody>
 </table>
 
-An inference engine for the Liquid language architecture,
-written without dependencies in pure and optimized C11.
+Two inference engines, written without dependencies in pure and optimized C11:
+one for the Liquid language architecture, one for yolo26.
 
-It runs Hugging Face checkpoints directly (included in the repository).
+Both read the published checkpoints directly — a Hugging Face folder and an
+Ultralytics `.pt` — with no conversion step (the checkpoints are included in
+the repository).
 
 ## ↘️✴️ QUICKSTART
 
@@ -31,6 +33,59 @@ can see; on text the model should find easy, most of its confidence. Add
 pass, which is worth about a quarter on work whose answer quotes its question
 and costs nothing when it does not.
 Add `--threads N` to pick a worker count; the default is the host's core count.
+
+### ➖ PICTURES
+
+`app/yolo.c` is the second engine: it runs a yolo26 checkpoint from the `.pt`
+Ultralytics publishes, which is a zip holding a pickled module tree and its raw
+fp16 weights. There is no export step and no Python in the path.
+
+```sh
+./build/app_yolo ckpt/yolo26/yolo26n.pt photo.jpg
+./build/app_yolo ckpt/yolo26/yolo26n-seg.pt photo.jpg --draw out.png
+./build/app_yolo ckpt/yolo26/yolo26n.pt photo.jpg --nms-free
+./build/app_yolo ckpt/yolo26/yolo26x-pose.pt photo.jpg --conf 0.4
+./build/app_yolo ckpt/yolo26/yolo26n-cls.pt photo.jpg
+```
+
+All five tasks run: detection, segmentation with per-instance masks, pose with
+keypoints, oriented boxes, and classification. Every size letter — n, s, m, l,
+x — loads through the same code, because the channel counts are read from the
+checkpoint rather than re-derived from a scale table.
+
+yolo26 ships two detection heads. The one-to-many head needs suppression and is
+what `yolo predict` uses; `--nms-free` reads the one-to-one head instead, which
+is the NMS-free path the architecture is known for. Pictures come in through
+stb, so every format it reads is a format the engine reads; `-DYOLO_NO_STB`
+builds without it and reads binary PNM only.
+
+The results match ultralytics 8.3.222 to every digit it prints, given the same
+decoded pixels — see **Comparison** below.
+
+```c
+#include "yolo.c"
+
+YoloModel *model; YoloSession *session; YoloOptions options;
+YoloImage image; const YoloResult *result;
+
+yolo_model_open("ckpt/yolo26/yolo26n.pt", &model);
+yolo_options_default(model, &options);
+yolo_session_open(model, &options, &session);
+yolo_image_read("photo.jpg", &image);
+yolo_session_run(session, &image, &result);
+
+for (int i = 0; i < result->box_count; i++) {
+    const YoloBox *box = &result->box_list[i];
+    printf("%s %.3f  %.1f %.1f %.1f %.1f\n",
+           yolo_model_class_name(model, box->class_index), box->score,
+           box->left, box->top, box->right, box->bottom);
+}
+```
+
+Every coordinate a result carries is in the source picture's pixels, not the
+letterboxed input's. A session holds the scratch one picture needs and
+allocates nothing after the first, so a run over a stream of pictures does not
+touch `malloc`.
 
 ```sh
 python3 util/make.py test                                 # unit tests plus reference comparison
@@ -100,6 +155,19 @@ not one set of dimensions.
 | threading              | POSIX threads, Windows threads, or single threaded             |
 | vector width           | AVX-512, AVX2, NEON, or plain C — same source at every width   |
 
+The picture engine (`app/yolo.c`) is a separate translation unit with its own
+seam and its own store; the two share conventions and nothing else.
+
+| capability            | supported                                                            |
+| --------------------- | -------------------------------------------------------------------- |
+| checkpoint            | an Ultralytics `.pt` read directly — zip, pickle, fp16 storages       |
+| tasks                 | detect, segment, pose, obb, classify                                  |
+| sizes                 | n, s, m, l, x — read from the checkpoint, not from a scale table      |
+| detection heads       | one-to-many with suppression (the default), and the NMS-free one-to-one |
+| stored weight formats | f16, bf16, f32, f64 and the integer storages, all widened to f32 at load |
+| picture formats       | everything stb reads; binary PNM without it                           |
+| backends              | a nine-operation seam, with CPU as its reference implementation       |
+
 ## ↘️✴️ EVALUATE
 
 `test/test.py` builds small Liquid checkpoints with random weights, runs them
@@ -145,6 +213,47 @@ AVX-512 host, before the paired dot:
 Decode scaled 2.4 → 4.6 → 8.9 tok/s across one, two, and four threads there.
 Loading bf16 costs about a tenth of a second because the weights are memory
 mapped and never copied; repacking to q8 costs a few seconds once.
+
+### ➖ Pictures, against ultralytics
+
+`app/yolo.c` against `ultralytics` 8.3.222 out of `ckpt/yolo26/py`, on the two
+pictures ultralytics ships, on the same four-core AVX-512 host. **Compared on
+the same decoded pixels** — stb and OpenCV do not agree on a JPEG to the last
+unit, so the pictures are written out as PNG first and a `.jpg` comparison
+would measure the two decoders as much as the engines.
+
+| checkpoint | picture | reference | engine |
+| --- | --- | --- | --- |
+| yolo26n | bus | bus 0.881, person 0.872, 0.861, 0.846, 0.656 | the same, every digit |
+| yolo26n `--nms-free` | zidane | person 0.915, 0.910, tie 0.527 | the same, every digit |
+| yolo26s | bus | person 0.923, bus 0.923, person 0.898, 0.846, 0.833 | the same, every digit |
+| yolo26x-seg | bus | bus 0.939, person 0.937, 0.923, 0.896, 0.754, 0.588 | the same, every digit |
+| yolo26n-pose | bus | five people and their keypoints | the same, every digit |
+| yolo26n-obb | bus | ground track field 0.027, centre 12.1 284.4, angle 0.449 | the same, every digit |
+| yolo26n-cls | bus | minibus 0.5165 | the same |
+
+Underneath the printed digits, the shaped input is **bit for bit identical** to
+what the reference feeds its model, and the head's class logits agree to
+**1.9e-5** over every logit that can become a detection. What is left is float
+summation order, which is a different question to correctness.
+
+Segmentation masks are the one place the two do not line up directly, and not
+because they disagree: the reference returns masks at the model's input size,
+this engine lifts each one straight to the source picture's pixels. Taking the
+resolution difference out, the areas agree to a third of a percent.
+
+Rates on that host, yolo26n at 640 over bus.png, the minimum of five runs:
+
+| | shape | forward | decode | total |
+| --- | --- | --- | --- | --- |
+| detect, 480x640 | 5 ms | 397 ms | 2 ms | 405 ms |
+| classify, 224x224 | 2 ms | 50 ms | 0 ms | 57 ms |
+| obb, 768x1024 | 21 ms | 2035 ms | 0 ms | 2056 ms |
+
+One thread, no intrinsics — the kernels are written in the shape a compiler
+vectorises rather than in the instruction set of one host. Threading is the
+first open item in `TODO.md` and is worth more than anything left in the
+kernel.
 
 ## ↘️✴️ FINETUNE
 

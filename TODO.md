@@ -1,8 +1,9 @@
 # TODO (Open)
 
-Open work, most consequential first. Nothing here is required for the engine to
-run correctly today; everything here either makes it faster, makes it honest
-about what it costs, or lets it read a checkpoint it currently refuses.
+Open work, most consequential first, the text engine then the picture engine.
+Nothing here is required for either engine to run correctly today; everything
+here either makes one faster, makes it honest about what it costs, or lets it
+read a checkpoint it currently refuses.
 
 The order comes from where the time goes, and the cost split in `CHANGES.md`'s
 standing results is the argument for it. Decode reads every weight once a
@@ -175,6 +176,132 @@ Everything below that is coverage, reliability and reach.
     seam is in place and the CPU backend is the reference implementation of it;
     nothing has been written on the other side. Six operations is the whole
     surface.
+
+## The picture engine
+
+`app/yolo.c` runs every published yolo26 checkpoint and matches the reference
+on all five tasks. What is below is speed, reach and the parts of the store it
+refuses.
+
+These are numbered from 36 rather than from 24, because the research items
+below keep their original numbering so that old citations to them resolve, and
+a new item taking a used number would break that. The numbers say what an item
+is, not where it sits.
+
+The order comes from where the time goes: a 640 picture spends 98% of
+its run in the forward pass, on one thread, with no intrinsics, so the first
+two items are worth more than everything after them together.
+
+36. **Run the forward pass on more than one thread.** 405 ms of a 405 ms
+    detection is one core's arithmetic, and a convolution over a feature map is
+    the most parallel thing in either engine — every output row is independent
+    of every other. `YoloOptions.thread_count` is already in the interface and
+    is ignored. The seam to split at is `conv_run`, over the output rows of one
+    group, because that keeps the weight panel shared and the writes disjoint.
+    `app/core.c` has a pool with the platform arms already written; copying it
+    rather than sharing it is the right move here, since the file list turning
+    on a shared header is what 1.7.0 refused. On a four-core host this is the
+    difference between 405 ms and something near 110 ms, and it is worth more
+    than every other item in this section.
+
+37. **Write the convolution kernel in intrinsics, per width.** The tile kernel
+    is a fixed-size array with constant bounds, which a compiler turns into
+    vector registers and which measured 3.0x over the row-add form — but it is
+    at the compiler's discretion, which is why `-O3` is 70% slower than `-O2`
+    here and why the build has to say so. An `ILL_SIMD_NAME`-style guarded
+    block per width, as `app/core.c` carries, makes the register allocation the
+    file's decision rather than the optimiser's, and takes the flag sensitivity
+    out with it. Measure against the current 376 ms before writing any of it;
+    if the gap is under 1.3x it is not worth the instruction sets.
+
+38. **Quantise the weights.** yolo26x is 142 MB of fp16, widened to 284 MB of
+    f32 at load because every kernel reads floats. An f16 plane read and widened
+    in the dot, as `app/core.c` does for bf16, halves the memory and is exact
+    for the format; q8 halves it again for a cost that has to be measured on
+    mAP rather than asserted. This matters most at the large end, where the
+    weights stop fitting in cache between layers.
+
+39. **Reuse the lowered patch matrix across a group.** `yolo_cpu_lower` builds
+    one for every group of every convolution, and for a 3x3 that is nine reads
+    of the input for one pass over it. A 1x1 convolution already skips it
+    entirely. The two cheap moves are lowering once for all groups where the
+    group count is small, and skipping the lowering for a 3x3 at stride one by
+    running three row-shifted 1x1 multiplies over the input in place — which is
+    the shape most of the backbone is.
+
+40. **Batch several pictures through one forward pass.** A session runs one
+    picture at a time and `YoloPlane` already carries a batch size that nothing
+    sets above one. A convolution over eight pictures is one matrix multiply
+    with eight times the columns, which is where the blocked kernel is at its
+    best. This is the serving item, and it does nothing for one picture.
+
+41. **A device backend against the `YoloBackend` seam.** Nine operations is the
+    whole surface, the CPU table is the reference implementation of it, and
+    `yolo_model_backend_set` is the switch. Nothing has been written on the
+    other side. Note that `conv_room` has to answer for the backend that will
+    run the convolution, not for the CPU one.
+
+42. **Read a deflated archive.** `torch.save` writes its zip stored, so every
+    published checkpoint loads; an archive that has been repacked — by a
+    release pipeline, by a user unzipping and rezipping — is refused with a
+    message saying so. An inflate is about 250 lines and would also let the
+    engine read a `.tar.gz`. It is a reach item, not a correctness one: the
+    refusal is honest and names the cause.
+
+43. **Read a zip64 archive.** Refused by name today. No yolo26 reaches four
+    gigabytes, so this is only reachable on a checkpoint nobody has published,
+    and it is two extra fields in the directory walk.
+
+44. **Widen the pickle reader to protocols 0 and 1.** The text opcodes —
+    `INT`, `STRING`, `UNICODE`, `PUT`, `GET`, `OBJ`, `INST` — are refused by
+    name. Torch has written protocol 2 since it started writing zips, so this
+    is unreachable through `torch.save`, and it is here so that the refusal is
+    a decision rather than an oversight.
+
+45. **Verify the oriented head on a picture it was trained for.** yolo26n-obb
+    matches the reference exactly on bus.png — one box, its centre, size and
+    angle — but a street photograph is nothing a DOTA checkpoint was trained
+    for, so that says the decode is right and not that the model is. The
+    rotated path needs an aerial picture with real objects in it: the angle
+    decode, `dist2rbox`, and the probabilistic overlap all go untested on
+    anything but noise today. **Blocked** on a picture, not a change.
+
+46. **Take the mask lift off a full-size plane a box.** A segmentation result
+    allocates one byte a source pixel for every box kept. At the default limit
+    of 300 boxes on a 4K picture that is 2.5 GiB, which nothing asks for today
+    and nothing prevents either. A run-length row list, or a plane cropped to
+    the box with its offset carried beside it, costs a caller one indirection
+    and removes the cliff.
+
+47. **Match Pillow's resize for the non-bilinear filters.** The classifier path
+    reproduces Pillow's bilinear exactly, which is what `torchvision`'s
+    `Resize` uses by default. A checkpoint whose `transforms` ask for bicubic
+    or Lanczos would be shaped with the wrong filter and silently scored a few
+    points off. The tap computation is already general; only the filter
+    function and its support are bilinear-specific.
+
+48. **Evaluate mAP against a dataset rather than against two pictures.** Every
+    claim in `CHANGES.md` 1.7.0 is agreement with the reference on bus and
+    zidane. That is the right check for an engine — it is the reference's
+    answer or it is not — but it says nothing about a checkpoint over a
+    distribution, and it would not catch a decode that is wrong only at a shape
+    neither picture has. COCO val is 5000 pictures and the engine is fast
+    enough to run it. **Blocked** on the dataset, not a change.
+
+49. **The remaining yolo families.** `A2C2f` and `ABlock` (yolo12), `RepConv`
+    and `RepVGGDW`, `WorldDetect` and the `YOLOE` heads, and `RTDETRDecoder`
+    are reported as `YOLO_ERR_MODULE` naming the module, which is the right
+    refusal and still a refusal. Each is a few dozen lines against the graph
+    builder and the forward pass, and the pickle already hands over everything
+    they need. Take them in the order someone asks for them.
+
+50. **Read a `.pt` that holds a bare `state_dict`.** The loader wants the
+    module tree, because that is what carries the graph. A checkpoint saved as
+    weights alone — which is what a training script that calls
+    `torch.save(model.state_dict())` produces — has no graph in it at all, and
+    would need the yaml path this engine deliberately does not have. Decide
+    whether that is worth a second loader before writing one; the refusal names
+    the cause today.
 
 ## Verification
 
