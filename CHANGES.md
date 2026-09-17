@@ -93,16 +93,22 @@ same shape of result.
 
 ### The published checkpoint
 
-`python3 util/make.py test --model ckpt/2.6b` runs the whole harness against the
-real `LiquidAI/LFM2.5-2.6B` weights, not a synthetic stand-in. On `xeon-2.8`
-against `transformers` 5.17.0 and `torch` 2.14.0, quiet machine, **23 of 23
-pass**:
+`python3 util/make.py test` runs the whole harness against the real
+`ckpt/lfm2.5-2.6b-a` weights, not a synthetic stand-in — that checkpoint is the
+default because it is the only one in `ckpt/` this engine can run, the others
+being an encoder and a vision-language model. On `xeon-2.8` against
+`transformers` 5.17.0 and `torch` 2.14.0, quiet machine, **25 of 25 pass**:
 
-- **logits** — max relative error 7.15e-06, top-1 agreement 100%.
-- **greedy** — the engine follows the reference for 155 characters, where the
-  reference primed a token at a time follows its own one-batch self for 0.
+- **logits** — max relative error 1.38e-06, top-1 agreement 100%. Tighter than
+  the 7.15e-06 the base checkpoint gave, on the same comparison.
+- **greedy** — the engine follows the reference for 42 characters, where the
+  reference primed a token at a time follows its own one-batch self for 0. The
+  bar is the reference's agreement with itself, not a fixed length, which is
+  why a different checkpoint moves the number without moving the result.
 - **throughput**, both sides at bf16 on the same threads — engine prefill
-  18.0 tok/s against the reference's 7.9, decode 5.1 against 3.5.
+  32.8 tok/s against the reference's 20.3, decode 5.8 against 4.0.
+- **draft** — `--draft 4` and `--draft 8` against plain greedy, identical
+  output. The speculation changes the rate and not the text.
 - **thread agreement** — 1 worker against 4, max relative error 0.00e+00. The
   engine's output does not depend on how many threads produced it.
 
