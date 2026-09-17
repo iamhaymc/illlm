@@ -521,10 +521,9 @@ UndefinedBehaviorSanitizer. Both suites run clean, including leak detection.
 
 A real checkpoint is tested the same way: `make.py test --model PATH` adds a
 logits comparison and a tokenizer comparison against it, for 25 comparisons in
-all. The published checkpoints ship in `ckpt/` (`ckpt/lfm2.5-2.6b-a-e`,
-`ckpt/lfm2.5-0.5b-x`, `ckpt/lfm2.5-2.6b-a`), with the smallest the default, so
-this runs by default, and it adds two further checks the synthetic suite
-cannot make:
+all. The published checkpoints ship in `ckpt/` (`ckpt/lfm2.5-0.4b-e`, `ckpt/lfm2.5-2.6b-a`), 
+with the smallest the default, so this runs by default, and it adds two further checks 
+the synthetic suite cannot make:
 
 - **throughput** — the engine's `bench` beside transformers doing the same
   shape of work: one batch of 256 tokens, then 64 single-token steps with the
