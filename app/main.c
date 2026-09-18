@@ -16,6 +16,17 @@
 
 #include "core.c"
 
+/* The Vulkan backend is a second translation-unit-sized file that fills the
+ * same IllBackend table `core.c` declares, and it is compiled in only when the
+ * build asks for it -- `python util/make.py build --vulkan`.  Without the
+ * define this file is exactly what it was, and `--backend vulkan` reports that
+ * no backend goes by that name.  VULK_NO_PICTURE leaves out the half of that
+ * file which serves `app/yolo.c`, since nothing here reads a picture. */
+#ifdef ILL_VULKAN
+#define VULK_NO_PICTURE
+#include "vulk.c"
+#endif
+
 /* -- shared options -------------------------------------------------------- */
 
 typedef struct AppOpts {
@@ -75,7 +86,7 @@ static void app_help(void)
 "  --threads N           worker threads (default: host cpu count)\n"
 "  --ctx N               context window in tokens (default 4096)\n"
 "  --batch N             prefill chunk in tokens (default 256)\n"
-"  --backend NAME        compute backend (default cpu)\n"
+"  --backend NAME        compute backend: cpu, or vulkan on a build that has it\n"
 "  --quiet               suppress load progress on stderr\n"
 "\n"
 "prompt options\n"
@@ -1023,6 +1034,13 @@ int main(int argc, char **argv)
 
     app_opts_init(&opts);
     if (!app_opts_read(&opts, argc, argv, 2)) return 1;
+
+#ifdef ILL_VULKAN
+    /* registering the table does not touch a device: that happens in `setup`,
+     * when a model is loaded against it, so this is safe on a host with no
+     * Vulkan at all */
+    (void)vulk_join();
+#endif
 
     if (!strcmp(verb, "info"))     return app_do_info(&opts);
     if (!strcmp(verb, "tokens"))   return app_do_tokens(&opts);

@@ -15,6 +15,7 @@ Build flavours
   --no-simd       compile the scalar reference kernels only
   --debug         no optimisation, assertions on
   --sanitize      address and undefined behaviour sanitizers (clang or gcc)
+  --vulkan        compile app/vulk.c into both engines and the tests
   --cc PATH       use a specific compiler
 
 Everything else after `--` goes straight to app.
@@ -101,7 +102,7 @@ def build_flags(cc, args):
             flags.append("/arch:AVX2")
         if args.no_simd:
             flags.append("/DILL_NO_SIMD")
-        return flags, [], True
+        return flags, [], True   # --vulkan adds its define per source below
 
     flags = ["-std=c11", "-Wall", "-Wextra"]
     flags += ["-O0", "-g3"] if args.debug else ["-O3", "-fno-math-errno"]
@@ -127,6 +128,14 @@ def build_flags(cc, args):
     link = ["-lm"]
     if os.name != "nt" and accepts(cc, ["-pthread"]):
         flags.append("-pthread")
+    if args.vulkan:
+        # app/vulk.c opens the Vulkan loader by name at run time and links
+        # against nothing, so this adds a define and, on hosts that keep
+        # dlopen out of libc, the library that carries it.  There is no SDK
+        # here and no header: a build with this flag still runs on a machine
+        # with no Vulkan at all.
+        if accepts(cc, ["-ldl"]):
+            link.append("-ldl")
     return flags, link, False
 
 
@@ -148,7 +157,8 @@ def do_build(args):
     flags, link, msvc = build_flags(cc, args)
     say(f"build with {cc}")
     print(f"  flavour: {'no-simd' if args.no_simd else 'portable' if args.portable else 'native'}"
-          f"{', debug' if args.debug else ''}{', sanitize' if args.sanitize else ''}")
+          f"{', debug' if args.debug else ''}{', sanitize' if args.sanitize else ''}"
+          f"{', vulkan' if args.vulkan else ''}")
     suffix = ".exe" if os.name == "nt" else ""
     # app/yolo.c is a library first and a command line second, so it only
     # grows a main() when YOLO_MAIN is defined.
@@ -164,10 +174,17 @@ def do_build(args):
     define = "/DYOLO_MAIN" if msvc else "-DYOLO_MAIN"
     if args.debug or args.sanitize:
         yolo_extra = []
-    for source, name, extra in ((os.path.join("app", "main.c"), APP, ()),
+    # app/vulk.c fills both backend seams and is compiled into whichever
+    # translation unit wants it: the text engine and the tests take
+    # ILL_VULKAN, the picture engine takes YOLO_VULKAN.  Neither define
+    # changes a line of the default build.
+    lead = "/D" if msvc else "-D"
+    text_vk = (lead + "ILL_VULKAN",) if args.vulkan else ()
+    pic_vk = (lead + "YOLO_VULKAN",) if args.vulkan else ()
+    for source, name, extra in ((os.path.join("app", "main.c"), APP, text_vk),
                                 (os.path.join("app", "yolo.c"), YOLO,
-                                 tuple(yolo_extra) + (define,)),
-                                (os.path.join("test", "test.c"), TEST, ())):
+                                 tuple(yolo_extra) + (define,) + pic_vk),
+                                (os.path.join("test", "test.c"), TEST, text_vk)):
         code = compile_one(cc, os.path.join(ROOT, source),
                            os.path.join(BUILD, name + suffix), flags, link, msvc,
                            extra)
@@ -301,6 +318,8 @@ def main():
     parser.add_argument("--no-simd", action="store_true", help="scalar kernels only")
     parser.add_argument("--debug", action="store_true", help="unoptimised build")
     parser.add_argument("--sanitize", action="store_true", help="address and ub sanitizers")
+    parser.add_argument("--vulkan", action="store_true",
+                        help="compile app/vulk.c into both engines and the tests")
     parser.add_argument("--model", default=None, help="checkpoint folder")
     parser.add_argument("--no-checkpoint", action="store_true",
                         help="skip the checkpoint suite even when ./ckpt/lfm2.5-2.6b-a exists")

@@ -30,6 +30,9 @@ can see; on text the model should find easy, most of its confidence. Add
 pass, which is worth about a quarter on work whose answer quotes its question
 and costs nothing when it does not.
 Add `--threads N` to pick a worker count; the default is the host's core count.
+Build with `--vulkan` and add `--backend vulkan` to run the arithmetic on a
+Vulkan device; it needs no SDK and no extra build step, and the ACCELERATE
+section says what it is and is not worth today.
 
 ```sh
 python3 util/make.py test                                 # unit tests plus reference comparison
@@ -152,6 +155,7 @@ not one set of dimensions.
 | sampling               | greedy, temperature, top-k, top-p, min-p, repetition penalty   |
 | threading              | POSIX threads, Windows threads, or single threaded             |
 | vector width           | AVX-512, AVX2, NEON, or plain C — same source at every width   |
+| backends               | a six-operation seam: CPU, and Vulkan on a `--vulkan` build    |
 
 The picture engine (`app/yolo.c`) is a separate translation unit with its own
 seam and its own store; the two share conventions and nothing else.
@@ -164,7 +168,7 @@ seam and its own store; the two share conventions and nothing else.
 | detection heads       | one-to-many with suppression (the default), and the NMS-free one-to-one |
 | stored weight formats | f16, bf16, f32, f64 and the integer storages, all widened to f32 at load |
 | picture formats       | everything stb reads; binary PNM without it                           |
-| backends              | a nine-operation seam, with CPU as its reference implementation       |
+| backends              | a nine-operation seam: CPU, and Vulkan on a `--vulkan` build          |
 
 ## ↘️ EVALUATE
 
@@ -397,10 +401,44 @@ The forward pass never calls a kernel directly.
 
 It calls through `IllBackend`, a table of the six shapes of work the stack performs —
 `dense`, `rmsnorm`, `swiglu`, `rope`, `attend`, `conv1d` — plus `setup`, `close`, and `width`.
+The picture engine has the same arrangement, `YoloBackend`, with nine
+operations.
 
-The CPU backend fills that table with threaded kernels
-and a device backend fills the same table and keeps its queue in `inner`.
-(Nothing above the seam changes).
+The CPU backend fills each table with threaded kernels. `app/vulk.c` fills both
+over Vulkan:
+
+```sh
+python3 util/make.py build --vulkan
+
+./build/app_main generate --model ckpt/lfm2.5-2.6b-a --backend vulkan --prompt "..."
+./build/app_yolo ckpt/yolo26/yolo26n.pt photo.png --device ""
+```
+
+`--device` takes part of a device's name, or an empty string for the first one
+that carries a compute queue. The text engine has no such flag, because
+`--backend` already names the backend; set `ILL_VULKAN_DEVICE` to pick between
+devices there.
+
+It adds **no dependency and no build step**. There is no `vulkan.h` here, no
+SDK and no `-lvulkan`: the file declares the ABI it uses and opens the loader
+with `dlopen` at run time, so a `--vulkan` build still compiles and still runs
+on a machine with no Vulkan — the backend reports itself unavailable and the
+CPU one is used. Its fourteen compute shaders are assembled into SPIR-V by the
+same file, at run time, so nothing in the tree is a blob you cannot read.
+
+It is correct: every operation agrees with the CPU table to about a part in a
+million, a whole 2.6B forward pass agrees to 1.14e-06 with the top fifty logits
+in the same order, greedy text follows the CPU's character for character, and
+yolo26n reports the same detections either way.
+
+It is not yet fast, and the reason is the seam rather than the shaders. Both
+seams pass host pointers, so every operation uploads its inputs and downloads
+its outputs — a 320 picture through yolo26n is 139 submissions and 46.4 MiB
+moved against 12 MiB of resident weights. Weights are cached on the device;
+activations cannot be, because nothing in the interface says when the host last
+wrote them. Every number measured for this backend was taken on SwiftShader, a
+software rasterizer, so **none of them is a GPU rate** and no claim is made
+about what a card would do. `TODO.md`'s device section says what is left.
 
 ## ↘️ DEVELOPMENT
 

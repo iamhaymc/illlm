@@ -172,11 +172,6 @@ Everything below that is coverage, reliability and reach.
     Reported as `ILL_VOCAB` rather than approximated, which is the right
     refusal and still a refusal.
 
-23. **Implement a device backend against the existing `IllBackend` seam.** The
-    seam is in place and the CPU backend is the reference implementation of it;
-    nothing has been written on the other side. Six operations is the whole
-    surface.
-
 ## The picture engine
 
 `app/yolo.c` runs every published yolo26 checkpoint and matches the reference
@@ -234,12 +229,6 @@ two items are worth more than everything after them together.
     sets above one. A convolution over eight pictures is one matrix multiply
     with eight times the columns, which is where the blocked kernel is at its
     best. This is the serving item, and it does nothing for one picture.
-
-41. **A device backend against the `YoloBackend` seam.** Nine operations is the
-    whole surface, the CPU table is the reference implementation of it, and
-    `yolo_model_backend_set` is the switch. Nothing has been written on the
-    other side. Note that `conv_room` has to answer for the backend that will
-    run the convolution, not for the CPU one.
 
 42. **Read a deflated archive.** `torch.save` writes its zip stored, so every
     published checkpoint loads; an archive that has been repacked — by a
@@ -302,6 +291,80 @@ two items are worth more than everything after them together.
     would need the yaml path this engine deliberately does not have. Decide
     whether that is worth a second loader before writing one; the refusal names
     the cause today.
+
+## The device backend
+
+`app/vulk.c` (1.8.0) fills both seams from one file, over Vulkan, with no
+dependency and no build step: it declares the ABI it uses, opens the loader by
+`dlopen`, and assembles its own SPIR-V. It is correct — every operation agrees
+with the CPU table to about a part in a million, and a whole 2.6B forward pass
+agrees to 1.14e-06 with the top fifty logits in the same order — and on the
+host it was written on it is slower than the CPU backend, because the only
+Vulkan device there is a software rasterizer.
+
+These are numbered from 51 rather than from 26 for the same reason the picture
+engine's are numbered from 36: every number below 51 is already an item, and a
+new item taking a used one would break a citation to it.
+
+51. **Let a backend keep activations on the device between operations.** Both
+    seams pass host pointers — `dense` takes a `const float *src` and a
+    `float *dst`, `conv_run` takes two `YoloPlane`s over malloc memory — so a
+    device backend uploads its inputs and downloads its outputs on every call,
+    because there is nowhere in either interface to say that an answer is
+    already on the device. Weights are cached by host pointer and are most of
+    the bytes; activations cannot be, because nothing says when the host last
+    wrote them. On `xeon-2.1` a 320 picture through yolo26n is 139 submissions
+    and 46.4 MiB moved against 12 MiB of resident weights — a feature map
+    crosses about four times — and one `logits` call on the 2.6B checkpoint is
+    320 submissions and 196.7 MiB. The move is an opaque buffer handle in both
+    seams, where the CPU backend answers a host pointer and a device one
+    answers a device address, with a `fetch` for the caller that genuinely
+    needs the bytes. This is worth more than everything else here for a device
+    build, and it is a change to `app/core.c` and `app/yolo.c` rather than to
+    `app/vulk.c`.
+
+52. **Read q8 and q4 planes on the device without widening them.**
+    `app/vulk.c` expands a quantised plane to f32 on the way across, which is
+    exact and throws away the reason the format exists: the 2.6B checkpoint at
+    q4 is 1.57 GiB and becomes 10.0 GiB of f32 on the device, which is more
+    than most cards have. The dense kernel would take the packed bytes and the
+    per-block scales as they are and unpack in the loop, which is one kernel a
+    format and is where the parity argument is hardest — the block layout has
+    to match `ill_q8_pack` exactly or the numbers drift without failing loudly.
+    Check it against `ill_plane_row` rather than against the CPU's own
+    quantised dot, which also quantises the activations and so is not the same
+    arithmetic.
+
+53. **Tile the device convolution through workgroup memory.** `app/vulk.c` runs
+    one invocation to an output cell, and every one of them reads its whole
+    weight patch and its window of the input out of global memory: a 3x3 over
+    64 input channels is 576 reads of the input and 576 of the weight for one
+    output cell, and the weight half is the same 576 floats for every cell of
+    that channel. A workgroup that holds
+    a tile of the input and the weight in shared memory and walks an output
+    tile from there is the standard fix, and the same argument applies to the
+    dense kernel's weight row. **Blocked**: a tile size chosen against a
+    software rasterizer is chosen against the wrong memory system.
+
+54. **Split a plane that overruns one storage binding into bands.** A storage
+    binding may not span more than `maxStorageBufferRange`, and the floor
+    Vulkan guarantees is 128 MiB. Real desktop drivers report two to four
+    gibibytes and SwiftShader reports one, so nothing measured so far comes
+    near it — the 2.6B checkpoint's vocabulary plane at f32 is 0.977 GiB, which
+    clears SwiftShader's limit by twenty-three thousandths. A driver reporting
+    the floor would refuse, by name, rather than reading past the limit, which
+    is undefined. The fix is to cut a plane into row bands, cache each band
+    separately, and dispatch one a band with a row offset in the push
+    constants; the same argument applies to a wide prefill's activations. Do it
+    before the first report of a device that refuses, not after.
+
+55. **Measure `app/vulk.c` on a real device.** Every number quoted for it was
+    taken on SwiftShader, so none of them is a GPU rate and none is quoted as
+    one. What a discrete card does with a workgroup reduction over sixty-four
+    lanes, a direct convolution with no shared memory tile, and a dispatch per
+    operation is unknown, and the three are likely to rank differently there
+    than here — which is also why items 51 to 54 cannot be ordered against each
+    other yet. **Blocked**: the work is scoped and the hardware is not here.
 
 ## Verification
 

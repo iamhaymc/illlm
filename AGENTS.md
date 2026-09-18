@@ -25,11 +25,17 @@ picture model and a language model have no kernel, no store and no vocabulary
 in common, and folding them together would give one file with two halves that
 never call each other.
 
+There is also **one file that is neither engine and serves both**.
+`app/vulk.c` fills `IllBackend`'s six operations and `YoloBackend`'s nine over
+Vulkan, and is compiled into whichever translation unit asks for it. It is not
+a third engine and does not run a model; it is the other side of two seams.
+
 | file              | what belongs in it                                                        | what must never go in it                            |
 | ----------------- | ------------------------------------------------------------------------- | --------------------------------------------------- |
 | `app/core.c`      | the text engine, one translation unit, fifteen layers bottom-up           | anything a second file would have to be created for |
 | `app/main.c`      | the command line front end; includes `core.c`                             | engine logic                                        |
 | `app/yolo.c`      | the picture engine, one translation unit, eleven layers bottom-up, with its own command line under `YOLO_MAIN` | anything the text engine also needs — copy it or leave it |
+| `app/vulk.c`      | the Vulkan backend for both seams: the ABI, the SPIR-V assembler, fourteen kernels, both tables | anything an engine still needs on a host with no device |
 | `test/test.c`     | the unit tests for both engines; includes `../app/core.c` and `../app/yolo.c` | anything that needs a checkpoint it cannot make     |
 | `test/test.py`    | the reference comparison against `transformers`                           | anything the C unit tests already cover             |
 | `util/make.py`    | install, build, test, run, bench, clean                                   | a second build system                               |
@@ -45,13 +51,34 @@ The `.py` files are the reference comparison, the build workflow and the tune,
 not part of the engine. `util/make.py` is the only build system there is.
 
 **The file list is closed.** Do not add a source file, a header, or a build
-tool. It was opened once, at 1.7.0, for `app/yolo.c`, and the argument that
-carried it is the one to make again: a picture engine shares no kernel, no
-store and no vocabulary with a text one, so the alternative was one file with
-two halves that never call each other. Nothing smaller than a second
-architecture reopens it. `RESEARCH.md` used to exist and was folded into the
-end of `TODO.md`; `CHANGES.md` says so, and old citations to it by idea number
-still resolve.
+tool. It has been opened twice, and both arguments are on the record because
+they are the ones to make again.
+
+At 1.7.0, for `app/yolo.c`: a picture engine shares no kernel, no store and no
+vocabulary with a text one, so the alternative was one file with two halves
+that never call each other. Nothing smaller than a second architecture reopens
+the list on that argument.
+
+At 1.8.0, for `app/vulk.c`, on a different one: it is a single file that is
+neither engine and fills the seam of both. Folding it into `app/core.c` would
+put a Vulkan loader and a SPIR-V assembler inside the text engine and leave the
+picture engine unable to reach them; writing it twice would be the same two
+thousand lines of device, memory, pipeline and dispatch in two places. Nothing
+smaller than a second implementation of *both* seams reopens the list on that
+one.
+
+`RESEARCH.md` used to exist and was folded into the end of `TODO.md`;
+`CHANGES.md` says so, and old citations to it by idea number still resolve.
+
+**`app/vulk.c` depends on nothing at all**, and that is deliberate rather than
+incidental: there is no `vulkan.h`, no SDK and no `-lvulkan`. It declares the
+two dozen structures and fifty entry points it uses against the published ABI
+and opens the loader with `dlopen` at run time, so a build with `--vulkan`
+still compiles and still runs on a host with no Vulkan — the backend reports
+itself unavailable and the caller keeps the CPU one. Its shaders are assembled into SPIR-V at run
+time by the assembler in the same file, so the build gains no step and the tree
+gains no opaque blob. Keep it that way: a GPU must never become a build
+requirement for a project whose claim is that a C compiler is enough.
 
 **`app/yolo.c` depends on `app/libc11/stb_image.h` and
 `app/libc11/stb_image_write.h`**, which this repository already vendors, and on
@@ -153,6 +180,13 @@ earlier ones.
   Name them as sentences.
 - The suite must pass on the default and `--tuned` builds; `--wide` must at
   least compile. `python util/make.py test --tuned`.
+- `--vulkan` adds the backend's checks, and they are **only** run on a host
+  that has a Vulkan device; without one the suite says it skipped, which is
+  right — there is nothing to compare against. A change to `app/vulk.c` is not
+  tested until it has been run somewhere with a device, and
+  `python util/make.py test --vulkan` is how. Its checks are a tolerance rather
+  than bit for bit, because a device adds in a different order; that is a
+  property of the backend and not a licence to loosen anything else.
 - It must also pass on `--portable` and `--no-simd`, and the picture engine
   must report the **same detections** under all three: its output is compared
   against the reference to the digit, so a build flavour that moves it is a
@@ -198,7 +232,9 @@ consistent across all of them. Match it.
 ## 9. Working on this repository
 
 - Prepend the compiler to `PATH`, then `python util/make.py test --tuned`. There is no
-  other build step.
+  other build step. `--vulkan` compiles `app/vulk.c` in as well; it needs no
+  SDK, and on a host with no device the build still succeeds and the checks
+  skip.
 - Do not add dependencies. Not one, not for tests, not for tooling.
 - Generate test media rather than downloading it: both engines read binary PNM,
   and Python's `wave` module writes the RIFF the audio tower wants.

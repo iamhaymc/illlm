@@ -18,6 +18,13 @@ better than the machine can fetch.
 | host | cores | vector | bare sweep, 1 / 2 / 4 threads |
 | --- | --- | --- | --- |
 | `xeon-2.8` — Intel Xeon @ 2.80 GHz, virtual | 4 | AVX-512 with VNNI | 11.0 / 19.1 / 36.6 GB/s |
+| `xeon-2.1` — Intel Xeon @ 2.10 GHz, virtual | 4 | AVX-512 | not taken |
+
+`xeon-2.1` is where the Vulkan backend (1.8.0) was written, and its only Vulkan
+device is SwiftShader — a software rasterizer running SPIR-V on those same four
+cores. **No rate taken through it is a GPU rate.** What it can show is that the
+shaders are right and what the seam costs; what a discrete card does with these
+kernels is unmeasured, and is marked blocked rather than estimated.
 
 ### The cost split
 
@@ -94,6 +101,27 @@ pass**:
   18.0 tok/s against the reference's 7.9, decode 5.1 against 3.5.
 - **thread agreement** — 1 worker against 4, max relative error 0.00e+00. The
   engine's output does not depend on how many threads produced it.
+
+### What a host-pointer seam costs a device backend
+
+Both backend seams pass host pointers: `dense` takes a `const float *src` and a
+`float *dst`, `conv_run` takes two `YoloPlane`s over ordinary malloc memory.
+There is nowhere in either interface to say that an answer is already on the
+device and should stay there, so a device backend uploads its inputs and
+downloads its outputs on **every** call. Weights are cached by host pointer,
+because they are immutable after load; activations cannot be, because nothing
+in the seam says when the host last wrote them.
+
+Measured on `xeon-2.1` (1.8.0): yolo26n over a 320 picture is **139
+submissions and 46.4 MiB moved** against 12 MiB of resident weights — a feature
+map crosses about four times. The 2.6B text checkpoint, one `logits` call on a
+six token prompt, is **320 submissions and 196.7 MiB moved**.
+
+So a device backend against these seams wins on large shapes and loses on small
+ones, and the submit-and-wait around a single-token dispatch can cost more than
+the arithmetic inside it. That is a property of the interface, not of any
+device, and it is the reason `TODO.md` item 51 is a change to `app/core.c` and
+`app/yolo.c` rather than to `app/vulk.c`.
 
 ### The refusal register
 
@@ -1081,3 +1109,270 @@ padding, so bus.jpg was right and zidane.jpg came out with its colour planes
 sliding into each other.
 
 **175 pass**, 132 before.
+
+---
+
+## 1.8.0 — a vulkan backend, for both seams at once
+
+Both engines end their kernel section with a table of function pointers and a
+comment saying an accelerator fills it. `IllBackend` has six operations,
+`YoloBackend` has nine, and across every version in this log nothing had ever
+been written on the other side of either. `TODO.md` items 23 and 41 were that
+gap, one apiece. `app/vulk.c` closes both.
+
+It is one file rather than two because the halves that differ are fourteen
+compute shaders and the half that is the same — finding a device, allocating on
+it, building a pipeline, getting a dispatch to run and the answer back — is
+about two thousand lines that neither engine should own twice. A build takes
+whichever half it wants: `app/main.c` compiles it with `VULK_NO_PICTURE` so
+`ill` does not grow an image reader, `app/yolo.c` with `VULK_NO_TEXT`.
+
+**The file list opened a second time**, and the argument is not the one 1.7.0
+made. That was a second architecture. This is one file that is neither
+engine and serves both: folding it into `app/core.c` would put a SPIR-V
+assembler and a Vulkan loader in the text engine and leave the picture engine
+unable to reach them, and writing it twice would be the same two thousand lines
+in two places. `AGENTS.md` now says so, and the rule it states is unchanged:
+nothing smaller than this reopens the list.
+
+### What it took
+
+Three decisions shape the file, and each of them is a refusal.
+
+**No dependency, at any level.** There is no `vulkan.h`, no SDK, no `-lvulkan`,
+and nothing in `util/make.py` beyond one define. The file declares the two dozen
+structures and fifty entry points it uses against the published ABI and
+resolves them through `dlopen` at run time. A build with `--vulkan` on a host
+with no Vulkan at all still compiles and still runs; the backend reports itself
+unavailable and the caller keeps the CPU one. That is the only arrangement
+which does not make a GPU a build requirement for a project whose whole claim
+is that a C compiler is enough. Two ABI conventions carry the weight and are
+stated in the file rather than assumed: dispatchable handles are pointers and
+non-dispatchable handles are always 64 bits, on a 32 bit host as much as a
+64 bit one; and every structure begins with a tag the driver reads rather than
+trusting the call it arrived through.
+
+**The shaders are assembled here, at run time.** The usual arrangement — GLSL
+compiled by `glslc` into a blob pasted into the source — needs a shader
+compiler in the build and leaves twelve kilobytes of hex in the tree that
+nobody can read or check. Part 3 is a SPIR-V assembler, about seven hundred
+lines, and part 4 writes the fourteen kernels against it. Two shortcuts keep it
+small enough to read. **No phi nodes**: every variable that crosses a branch is
+an `OpVariable` in the Function storage class, read and written, which is what
+glslang emits before its own mem2reg pass and what every driver turns back into
+registers — it removes the only genuinely hard part of emitting structured
+control flow by hand and costs nothing at run time. **One buffer shape**: every
+binding is `struct { float cell[]; }` in the Uniform storage class with the
+BufferBlock decoration, which is how a storage buffer is spelled in SPIR-V 1.0
+and therefore works on a driver as old as Vulkan 1.0; integers ride in the same
+buffers through `OpBitcast`, and the push constants are sixteen raw words read
+the same way, so there is one descriptor layout and one push range for all
+fourteen kernels.
+
+**Quantised weights are widened once, on the way to the device.** A q4 plane is
+a fifth of the f32 it came from, and that is why the text engine has it; here it
+is expanded back to f32 as it is uploaded and the saving is lost. The
+alternative — unpacking blocks inside the dense kernel — is a better use of
+device memory and a worse use of the first version of this file, because it
+needs one kernel per weight format and the formats are where the parity
+argument is hardest. Widening is exact for f32, f16 and bf16, and for q8 and q4
+it goes through `ill_plane_row`, the engine's own widening, so the device is
+handed exactly the values the CPU dot product would have reconstructed. The
+packed form is item 52.
+
+Two kernels are not restatements of the CPU's, and both had to be.
+
+**Attention streams.** The CPU writes the whole row of scores, takes a softmax
+over it, and mixes; that needs `span` floats of scratch a worker, which the
+seam supplies as `board`. A device would need `tokens * heads * span`, which at
+a 512 token prefill with 32 heads and a 4096 window is 256 MiB of scratch for a
+step whose output is 4 MiB. So the device kernel runs the streaming form: one
+workgroup to a (token, head) pair, the span walked in chunks of sixty-four, a
+running maximum and a running total both rescaled every time the maximum moves,
+and the partial mix living in the output row. It reaches the same answer in one
+pass over the keys and values, needs no scratch, and ignores `board` entirely.
+This is TODO item 4's arithmetic, arrived at from the other direction: there it
+is a decision because it would move the CPU's output, here there is no old
+output to move.
+
+**Convolution is direct.** The CPU lowers a patch matrix and multiplies, because
+a contiguous stream is what a compiler vectorises. On a device the lowering is
+nine reads and nine writes of the whole feature map for a 3x3, all through
+memory, where the direct form reads the input nine times out of cache and
+writes the output once. So `conv_room` answers zero — there is nothing to lower
+into. Item 41 said `conv_room` has to answer for the backend that will run the
+convolution rather than for the CPU one, and this is what that meant.
+
+### What it is worth
+
+**On this host, nothing, and the reason is the seam rather than the shaders.**
+
+The host is `xeon-2.1` — Intel Xeon @ 2.10 GHz, virtual, 4 cores, AVX-512, 15
+GiB — and the only Vulkan device on it is SwiftShader, a software rasterizer,
+which runs SPIR-V on the same four cores the CPU backend already has. A
+software device cannot show what a real one would do; what it can show is that
+the shaders are right and what the interface costs.
+
+yolo26n over a generated 320 picture, best of five: **CPU 164 ms, Vulkan
+2751 ms** — 16.7x slower. The detections are identical to the digit printed,
+and the head's 475,204 raw values agree to 2.44e-06 relative.
+
+The 2.6B text checkpoint, one `logits` call on a six token prompt: **128,000
+logits, max relative error 1.14e-06, and the top fifty in the same order**. The
+run made 320 submissions and moved 196.7 MiB. Greedy `generate` on the same
+checkpoint follows the CPU backend for all 24 tokens asked for — 123
+characters, **identical character for character**, which is what a top-1 that
+never disagrees looks like once it is fed back in.
+
+Those two counts are the result worth keeping. **Both seams pass host
+pointers** — `dense` is handed a `const float *src` and a `float *dst`,
+`conv_run` two `YoloPlane`s over malloc memory — so there is nowhere in either
+interface to say "the answer is already on the device, leave it there". Every
+operation uploads its inputs and downloads its outputs. Weights are cached by
+host pointer, because they are immutable after load and that is most of the
+traffic; activations are not, because nothing in the seam says when the host
+last wrote them. A 320 picture is 139 submissions and 46.4 MiB moved against
+12 MiB of resident weights: the feature maps cross about four times each, out
+of the convolution that made them, into the concatenation, out again, into the
+next convolution.
+
+What that supports is a statement about the interface and not about any
+device: on a per-operation synchronous seam the submit-and-wait around a
+dispatch can cost more than the arithmetic inside it, and the smaller the shape
+the worse that is. Whether a large enough shape comes out ahead on real
+hardware is **not measured and is not claimed**. Moving the seam to
+device-resident activations is item 51, and it is a change to `app/core.c` and
+`app/yolo.c` rather than to this file.
+
+**No rate here is a GPU rate**, and none should be quoted as one. What a
+discrete card does with these kernels is unmeasured and is marked **blocked**
+in `TODO.md` for that reason, not estimated.
+
+### That it is the same answer
+
+It is not the same answer bit for bit, and it cannot be. The dense kernel folds
+sixty-four partial sums through a tree where the CPU walks the row, and no
+reordering of floating point addition is exact. What is claimed is that the two
+agree to about a part in a million of the magnitude involved, which is what a
+reordered sum costs and no more — 5.8e-07 on dense, 7.2e-07 on attention across
+several chunks, 1.14e-06 over a whole 2.6B forward pass.
+
+The CPU table is untouched by any of this and still holds bit for bit against
+itself, which is the property §5 of `AGENTS.md` asks for. A backend is
+selected, not applied: a run that does not say `--backend vulkan` or
+`--device` is the run it was before this version, through the same kernels.
+
+### Code
+
+One refusal is worth naming because it is a limit nothing here comes near and
+a driver elsewhere might. A storage binding may not span more than
+`maxStorageBufferRange`, and the floor Vulkan guarantees for that is 128 MiB.
+Real desktop drivers report two to four gibibytes and SwiftShader reports one,
+so the largest binding in any of this — the 2.6B checkpoint's vocabulary plane
+at f32, 0.977 GiB — clears it by twenty-three thousandths. Reading past the
+limit is undefined rather than an error, so it is checked and refused by name
+instead; splitting a plane into bands is item 54.
+
+One environment switch is worth naming because of what it is for. A discrete
+card has device memory the host cannot see, so every buffer needs a staging
+copy and a `vkCmdCopyBuffer`; an integrated part often reports a memory type
+that is both device local and host visible, and there the staging copy is pure
+loss because the pointer `vkMapMemory` returns is the memory the shader reads.
+Both paths are in the file, and on a host whose only device is SwiftShader
+everything is unified, so the staged one would never run. `ILL_VULKAN_STAGED`
+makes the memory picker refuse the unified type, and the checks pass under it
+as well as without it — 38 submissions against 24, which is the weight uploads
+taking a copy of their own.
+
+`app/vulk.c`, new, eleven parts bottom-up: the Vulkan ABI this file declares
+for itself and the loader that opens it by name; the device, its memory types
+and the one command buffer everything is recorded into; the SPIR-V assembler;
+the fourteen kernels; pipelines, descriptors and dispatch; residence and the
+weight cache; opening and closing a device; one operation end to end;
+the `IllBackend` table; the `YoloBackend` table; and the comparison in part 11,
+which runs under `VULK_MAIN` as a standalone command and under `VULK_PROBE`
+from the test suite, so the two cannot drift apart.
+
+`app/main.c`: a guarded include and one call to `vulk_join` under
+`ILL_VULKAN`. Registering the table does not touch a device — that happens in
+`setup`, when a model is loaded against it — so it is safe to call on a host
+with no Vulkan, and `--backend vulkan` reports the reason when there is none.
+
+`app/yolo.c`: a guarded include under `YOLO_VULKAN`, a `--device NAME` flag,
+and a line at the end of a run saying how many submissions it took and how many
+bytes crossed.
+
+`util/make.py`: `--vulkan`, which adds `ILL_VULKAN` to `app/main.c` and
+`test/test.c`, `YOLO_VULKAN` to `app/yolo.c`, and `-ldl` where dlopen is not in
+libc. No second build step and no probe for an SDK, because there is nothing to
+probe for.
+
+`AGENTS.md`, `README.md`, `GUIDE.md`, `TODO.md`: the new file and the second
+argument for opening a list that says it is closed, what selects the backend,
+and what is left.
+
+### Tests
+
+`test/test.c` gains a `vulkan` section under `ILL_VULKAN`, which is
+`app/vulk.c`'s own comparison reported through this harness rather than a
+second copy of it. Thirty-one checks: the registry takes the table and
+reports it by name; every one of the six text operations and every one of the
+nine picture operations against the CPU table over the same input; a padded
+3x3, a strided, a depthwise and a grouped convolution separately, because they
+are four different paths through one kernel; the convolution, the transposed
+convolution and the short convolution again with **no bias**, which is the
+path where the kernel must not read the one-float stand-in bound in a bias's
+place; `conv_room` answering zero where the CPU's answers more; and four on
+the weight cache — that a second call takes
+the cached upload and reaches the same answer, that a plane of a different
+width at the same address is not a hit, that the wider plane still reads
+correctly afterwards, and that a weight an operation is already holding is not
+evicted by the next weight the same operation asks for.
+
+A host with no Vulkan device runs no comparisons and is not a failure: there is
+nothing to compare against, so the suite says it skipped and moves on. The
+default build does not define `ILL_VULKAN` at all and is unchanged.
+
+They bite. Dropping the last column from the dense loop fails two checks;
+flipping the sign on rope's sine fails one; skipping the rescale in the
+streaming attention fails one — but only after the window was widened past
+sixty-four, because a span that fits in one chunk never rescales and the first
+version of that check did not; running the dense kernel over one token instead
+of all of them fails two; ignoring the pad in the convolution fails four; never
+rolling the short convolution's window fails two; taking a minimum instead of a
+maximum in the pool fails one.
+
+Two things the checks found and one they did not.
+
+The cache keyed on the host pointer alone would hand a narrower plane the wider
+plane's upload, which is why the byte count is part of the key and why there is
+a check for it.
+
+The second was a review finding rather than a failing check, and the check came
+after: an operation that wants two weights — the short convolution's taps and
+its bias, a convolution's sheet and its bias — looks both up before it
+dispatches, and **the second lookup can be the miss that evicts the first**.
+The caller is then holding a pointer to a slab whose buffer has been destroyed
+and whose slot has been overwritten by whatever entry was last in the list. A
+cache entry an operation is using is now pinned and is not a candidate for
+eviction; `vulk_op` releases the pins once the dispatch has completed. The
+check for it runs the short convolution with a budget too small to hold both of
+its weights, which makes the eviction certain rather than likely. Ignoring the
+pin fails it by 5.7e+36, which is what reading a destroyed buffer looks like.
+
+A third was found the same way and has no check that can be relied on to bite.
+A bias was read with a select — `has_bias ? bias[c] : 0` — and a select
+evaluates both of its arms, so with no bias the load ran off the end of the
+one-float buffer bound in its place. Reading past a storage buffer is undefined
+without `robustBufferAccess`, which this file does not ask a device to enable,
+so the read had to not happen rather than be harmless: it is a branch now. The
+no-bias path is covered by three new checks, and whether they would have failed
+before the change is a property of the driver rather than of the code, which is
+the whole reason the read was removed instead of measured.
+
+And replacing the running maximum with the chunk's own maximum fails nothing —
+that turned out to be correct rather than a gap, because the streaming softmax
+is exact for any pivot so long as the rescale uses the same one; it changes the
+numerical range and not the answer.
+
+**206 pass**, 175 before.
