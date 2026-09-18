@@ -7,9 +7,11 @@
 </tbody>
 </table>
 
-A fast and tiny engine for agentic  inference, vision, and speech
+A fast and tiny engine for 
+agentic inference and vision
 
-In pure and optimized C11 that is designed to be accelerated.
+In pure and optimized C11 that
+utilizes CPU or Vulkan acceleration.
 
 ## ✴️ QUICKSTART
 
