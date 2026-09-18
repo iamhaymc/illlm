@@ -1257,10 +1257,19 @@ agree to about a part in a million of the magnitude involved, which is what a
 reordered sum costs and no more — 5.8e-07 on dense, 7.2e-07 on attention across
 several chunks, 1.14e-06 over a whole 2.6B forward pass.
 
-The CPU table is untouched by any of this and still holds bit for bit against
-itself, which is the property §5 of `AGENTS.md` asks for. A backend is
-selected, not applied: a run that does not say `--backend vulkan` or
-`--device` is the run it was before this version, through the same kernels.
+The CPU tables are untouched, and that is visible in the diff before it is
+measured: **`app/core.c` has no change at all**, and every line added to
+`app/yolo.c` sits inside `#ifdef YOLO_VULKAN`. A default build compiles the
+same text it compiled before; the one unconditional change outside the new
+file is a line of `--backend` help.
+
+Measured anyway, because §5 of `AGENTS.md` asks for the binary and not the
+argument. Against binaries built from the previous commit — `git archive HEAD
+app/`, built aside — the default build's 2.6B `logits` row, its 48 token
+greedy continuation, and yolo26n's dumped head rows are all **byte identical**.
+A backend is selected, not applied: a run that does not say `--backend vulkan`
+or `--device` is the run it was before this version, through the same
+kernels.
 
 ### Code
 
@@ -1281,8 +1290,10 @@ loss because the pointer `vkMapMemory` returns is the memory the shader reads.
 Both paths are in the file, and on a host whose only device is SwiftShader
 everything is unified, so the staged one would never run. `ILL_VULKAN_STAGED`
 makes the memory picker refuse the unified type, and the checks pass under it
-as well as without it — 38 submissions against 24, which is the weight uploads
-taking a copy of their own.
+as well as without it. What it costs is visible in the counters: the same 320
+picture through yolo26n is 139 submissions unified and 343 staged, because
+every weight that misses the cache now needs a submission of its own to get
+its staging copy across.
 
 `app/vulk.c`, new, eleven parts bottom-up: the Vulkan ABI this file declares
 for itself and the loader that opens it by name; the device, its memory types
@@ -1330,17 +1341,36 @@ correctly afterwards, and that a weight an operation is already holding is not
 evicted by the next weight the same operation asks for.
 
 A host with no Vulkan device runs no comparisons and is not a failure: there is
-nothing to compare against, so the suite says it skipped and moves on. The
-default build does not define `ILL_VULKAN` at all and is unchanged.
+nothing to compare against, so the suite says it skipped and moves on — 178
+checks there rather than 206. The default build does not define `ILL_VULKAN` at
+all and is unchanged at 175.
 
-They bite. Dropping the last column from the dense loop fails two checks;
-flipping the sign on rope's sine fails one; skipping the rescale in the
-streaming attention fails one — but only after the window was widened past
-sixty-four, because a span that fits in one chunk never rescales and the first
-version of that check did not; running the dense kernel over one token instead
-of all of them fails two; ignoring the pad in the convolution fails four; never
-rolling the short convolution's window fails two; taking a minimum instead of a
-maximum in the pool fails one.
+The whole matrix: native, portable, no-simd, debug and sanitize, each with and
+without `--vulkan`, plus the no-device path and `ILL_VULKAN_STAGED`. Twelve
+runs, nothing failing in any of them.
+
+They bite, and the count says how many checks share a kernel:
+
+| what was broken | checks that fail |
+| --- | --- |
+| dense drops the last column of every row | 5 |
+| dense runs one token instead of all of them | 5 |
+| the convolution ignores its pad | 5 |
+| the short convolution never rolls its window | 4 |
+| the convolution ignores the group offset | 2 |
+| the transposed convolution reads its weight as [out, in, k, k] | 2 |
+| rms norm forgets the gain | 1 |
+| rope's sine changes sign | 1 |
+| the streaming attention skips the rescale | 1 |
+| attention drops the causal horizon | 1 |
+| the pool takes a minimum | 1 |
+| the gemm ignores the swap flag | 1 |
+| the cache ignores the pin | 1 |
+
+The rescale is the one that had to be earned. It failed nothing until the
+window was widened past sixty-four, because a span that fits in one chunk never
+rescales and the first version of that check did not — the check was broadened
+because the mutation did not bite, which is what §6 asks the mutation for.
 
 Two things the checks found and one they did not.
 
@@ -1366,9 +1396,12 @@ evaluates both of its arms, so with no bias the load ran off the end of the
 one-float buffer bound in its place. Reading past a storage buffer is undefined
 without `robustBufferAccess`, which this file does not ask a device to enable,
 so the read had to not happen rather than be harmless: it is a branch now. The
-no-bias path is covered by three new checks, and whether they would have failed
-before the change is a property of the driver rather than of the code, which is
-the whole reason the read was removed instead of measured.
+no-bias path is covered by three new checks, and **putting the select back
+fails none of them** on SwiftShader, which reads past that buffer without
+complaint. That is the honest state of it: the fix rests on what the
+specification says is undefined, not on a number, and no check on this host can
+be made to stand behind it. A driver that faulted or returned rubbish would
+have made the same fix a bug report.
 
 And replacing the running maximum with the chunk's own maximum fails nothing —
 that turned out to be correct rather than a gap, because the streaming softmax
