@@ -56,7 +56,7 @@ function New-VenvIfMissing {
 }
 
 function Install-PythonPackages {
-    $packages = @("pyyaml", "trimesh", "build123d", "mitsuba", "openai", "github-copilot-sdk")
+    $packages = @("pyyaml")
     $venvPython = Join-Path ".venv" "Scripts\python.exe"
 
     $installed = @(uv pip list --python $venvPython 2>$null | Select-Object -Skip 2 | ForEach-Object { ($_ -split "\s+")[0].ToLower() })

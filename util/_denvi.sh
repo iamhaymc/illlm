@@ -49,7 +49,7 @@ create_venv() {
 }
 
 install_python_packages() {
-    local packages=(pyyaml trimesh build123d mitsuba openai github-copilot-sdk)
+    local packages=(pyyaml)
     local venv_python=".venv/bin/python"
 
     local installed

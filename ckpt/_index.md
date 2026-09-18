@@ -1,3 +1,4 @@
 - **lfm2.5-0.4b-e** -> https://huggingface.co/LiquidAI/LFM2.5-Encoder-350M
+- **lfm2.5-1.2b-t** -> https://huggingface.co/LiquidAI/LFM2.5-1.2b-thinking
 - **lfm2.5-2.6b-a** -> https://huggingface.co/saidutta69/lfm2.5-2.6b-a-fable5-coding-agent-heretic
 - **yolo26**        -> https://huggingface.co/Ultralytics/YOLO26
