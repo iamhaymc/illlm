@@ -4976,6 +4976,15 @@ YoloStatus yolo_result_draw(const YoloModel *model, const YoloResult *result,
  * user interface.
  * ------------------------------------------------------------------------ */
 
+/* The Vulkan backend fills the YoloBackend table this file declares, and is
+ * compiled in only when the build asks for it -- `python util/make.py build
+ * --vulkan`.  VULK_NO_TEXT leaves out the half of that file which serves
+ * `app/core.c`, since the picture engine has no use for it. */
+#ifdef YOLO_VULKAN
+#define VULK_NO_TEXT
+#include "vulk.c"
+#endif
+
 #ifdef YOLO_MAIN
 
 static void yolo_usage(void)
@@ -4997,6 +5006,9 @@ static void yolo_usage(void)
 "  --no-masks    skip lifting segmentation masks to the source\n"
 "  --draw PATH   write the picture with the result drawn on it\n"
 "  --repeat N    run the picture N times and report the fastest\n"
+#ifdef YOLO_VULKAN
+"  --device NAME run the arithmetic on a Vulkan device whose name holds NAME\n"
+#endif
 "  --dump PATH   write the shaped input and the head's rows, for a parity run\n"
 "  --info        describe the checkpoint and stop\n");
 }
@@ -5023,6 +5035,10 @@ int main(int argc, char **argv)
     YoloStatus status;
     const char *model_path = NULL, *image_path = NULL, *draw_path = NULL;
     const char *dump_path = NULL;
+#ifdef YOLO_VULKAN
+    const char *device_name = NULL;
+    int         device_flag = 0;
+#endif
     int class_room[64], class_count = 0, info_flag = 0, repeat_count = 1;
     int square_flag = 0, mask_off_flag = 0;
     int index, round;
@@ -5048,6 +5064,9 @@ int main(int argc, char **argv)
             else if (strcmp(word, "--draw") == 0) draw_path = value;
             else if (strcmp(word, "--repeat") == 0) repeat_count = atoi(value);
             else if (strcmp(word, "--dump") == 0) dump_path = value;
+#ifdef YOLO_VULKAN
+            else if (strcmp(word, "--device") == 0) { device_name = value; device_flag = 1; }
+#endif
             else if (strcmp(word, "--classes") == 0)
                 class_count = yolo_main_classes((char *)value, class_room, 64);
             else { index--; goto flag; }
@@ -5080,6 +5099,24 @@ flag:
         yolo_model_close(model);
         return 0;
     }
+
+#ifdef YOLO_VULKAN
+    /* the backend is set on the model and has to be set before a session is
+     * opened against it, which is the next thing that happens */
+    if (device_flag) {
+        const YoloBackend *card;
+        VulkStatus code = vulk_open(device_name);
+        if (code != VULK_OK) {
+            printf("no vulkan device: %s\n", vulk_status_text(code));
+            yolo_model_close(model);
+            return 1;
+        }
+        card = yolo_backend_vulkan();
+        if (!card) { printf("no vulkan device\n"); yolo_model_close(model); return 1; }
+        yolo_model_backend_set(model, card);
+        printf("device  %s\n", vulk_device_name());
+    }
+#endif
 
     {
         YoloOptions fresh;
@@ -5194,6 +5231,18 @@ flag:
     printf("%.1f ms  shape %.1f  forward %.1f  decode %.1f\n", best_ms,
            yolo_session_shape_time(session), yolo_session_forward_time(session),
            yolo_session_decode_time(session));
+#ifdef YOLO_VULKAN
+    /* the two numbers that say whether the seam or the arithmetic is in the
+     * way: a host pointer interface means every operation waits once and
+     * carries its input and its output across */
+    if (device_flag && vulk_ready()) {
+        uint64_t sent = 0, moved = 0;
+        vulk_report(&sent, &moved);
+        printf("device  %lu submissions, %.1f MiB moved, %.1f MiB resident\n",
+               (unsigned long)sent, (double)moved / 1048576.0,
+               (double)vulk_memory_used() / 1048576.0);
+    }
+#endif
 
     yolo_session_close(session);
     yolo_image_free(&image);

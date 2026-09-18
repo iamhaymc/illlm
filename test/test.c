@@ -17,6 +17,16 @@
 #define YOLO_NO_STB
 #include "../app/yolo.c"
 
+/* The Vulkan backend, on a build that asked for it -- `python util/make.py
+ * test --vulkan`.  VULK_PROBE brings in the comparison that file carries and
+ * leaves out its command line; the checks below are that comparison reported
+ * through this harness.  Without the define nothing here changes, which is why
+ * the default suite still builds on a host that has never heard of Vulkan. */
+#ifdef ILL_VULKAN
+#define VULK_PROBE
+#include "../app/vulk.c"
+#endif
+
 /* -- harness --------------------------------------------------------------- */
 
 static int32_t test_ran, test_bad;
@@ -1608,6 +1618,46 @@ static void test_yolo_picture(void)
               room[0] == 0 && room[1] == 9, "");
 }
 
+/* -- the vulkan backend ----------------------------------------------------- */
+
+/* Every check here is `app/vulk.c`'s own comparison of its table against the
+ * CPU one over the same input, reported through this harness.  The tolerance
+ * is relative rather than bit for bit, and deliberately: a device folds a dot
+ * product through a tree of sixty-four partial sums where the CPU walks the
+ * row, and no reordering of floating point addition is exact.  The CPU table
+ * is untouched by any of this and still holds bit for bit against itself.
+ *
+ * A host with no Vulkan device runs no comparisons and is not a failure --
+ * there is nothing to compare against -- so the suite says so and moves on. */
+#ifdef ILL_VULKAN
+static void test_vulkan_tell(void *ctx, const char *name, double worst, int good)
+{
+    (void)ctx;
+    test_case(name, good, "%.1e", worst);
+}
+#endif
+
+static void test_vulkan(void)
+{
+#ifdef ILL_VULKAN
+    const char *names[ILL_BACKEND_MAX];
+    int32_t     run = 0, count, index, found = 0;
+
+    test_open("vulkan");
+    test_case("joining the registry adds a backend called vulkan",
+              vulk_join() == ILL_OK, "");
+    count = ill_backend_list(names, ILL_BACKEND_MAX);
+    for (index = 0; index < count; ++index)
+        if (!strcmp(names[index], "vulkan")) found = 1;
+    test_case("and the registry reports it by that name", found, "%d backends", count);
+
+    (void)vulk_probe_all(test_vulkan_tell, NULL, &run);
+    if (run == 0)
+        test_case("no vulkan device on this host, so nothing was compared", 1, "skipped");
+    vulk_close();
+#endif
+}
+
 /* -- entry ----------------------------------------------------------------- */
 
 int main(void)
@@ -1634,6 +1684,7 @@ int main(void)
     test_yolo_boxes();
     test_yolo_pickle();
     test_yolo_picture();
+    test_vulkan();
 
     printf("\n%d checks, %d failed, %.2fs\n", test_ran, test_bad, ill_clock_now() - mark);
     return test_bad ? 1 : 0;

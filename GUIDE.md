@@ -18,7 +18,7 @@ arranged, and where to change it.
 
 ## 1. The shape of the project
 
-Six source files, flat, no build system, plus the published checkpoints in
+Seven source files, flat, no build system, plus the published checkpoints in
 `ckpt/`.
 
 | file | lines | role |
@@ -26,6 +26,7 @@ Six source files, flat, no build system, plus the published checkpoints in
 | `app/core.c` | ~4500 | the text engine: a header and its implementation in one file |
 | `app/main.c` | ~670 | the command line for it, six verbs |
 | `app/yolo.c` | ~4700 | the picture engine, the same way, with its own command line under `YOLO_MAIN` |
+| `app/vulk.c` | ~4300 | the Vulkan backend for both engines' seams; compiled in by `--vulkan` |
 | `test/test.c` | ~1500 | unit tests over both engines' internals |
 | `test/test.py` | ~780 | comparison against Hugging Face `transformers` |
 | `util/make.py` | ~280 | install, build, test, run, bench, clean |
@@ -34,9 +35,10 @@ Six source files, flat, no build system, plus the published checkpoints in
 | `ckpt/` | — | the checkpoints; `ckpt/lfm2.5-2.6b-a` is the one this engine runs |
 
 Sections 2 through 9 are about the text engine. The picture engine has its own
-tour at the end, in section 10; it shares this file's conventions and nothing
-else, because a picture model and a language model have no kernel, no store and
-no vocabulary in common.
+tour in section 10; it shares this file's conventions and nothing else, because
+a picture model and a language model have no kernel, no store and no vocabulary
+in common. Section 11 is the Vulkan backend, which is neither engine and fills
+the seam of both.
 
 `app/main.c` and `test/test.c` each begin with `#include "core.c"`. That is
 deliberate: the project has no header file, so the engine carries its own
@@ -588,7 +590,13 @@ and keeps the device handles in `inner`.
 
 The seam was drawn where it is because these six operations are the only
 arithmetic the stack performs, and each is large enough that a per-call
-dispatch is free.
+dispatch is free. **The second half of that sentence is the one that turned out
+to be conditional.** `app/vulk.c` (section 11) is the worked example, and what
+it found is that a dispatch is free at prefill widths and is not free at all
+for a single token: the seam passes host pointers, so every call also uploads
+its inputs and downloads its outputs, and a decode step is a hundred-odd
+round trips whose arithmetic is microseconds each. Read section 11 before
+drawing a second device backend against this seam.
 
 ### A new weight format
 
@@ -769,3 +777,161 @@ a boolean, `_sheet` a weight matrix.
 One name is worth pointing at because it is load-bearing and not obvious: an
 **oriented** pick keeps its centre in `left`/`top` and its size in
 `right`/`bottom`, because a rotated box has no corners to put there.
+
+
+---
+
+## 11. The Vulkan backend: inside vulk.c
+
+`app/vulk.c` is neither engine. It fills `IllBackend`'s six operations and
+`YoloBackend`'s nine, from one file, over Vulkan, and a build takes whichever
+half it wants: `VULK_NO_PICTURE` leaves out the half that serves `app/yolo.c`,
+`VULK_NO_TEXT` the half that serves `app/core.c`. It is one file rather than
+two because the halves that differ are fourteen compute shaders and the half
+that is the same — device, memory, pipeline, dispatch — is about two thousand
+lines that neither engine should own twice.
+
+```sh
+python3 util/make.py build --vulkan
+./build/app_main generate --model ckpt/lfm2.5-2.6b-a --backend vulkan --prompt "..."
+./build/app_yolo ckpt/yolo26/yolo26n.pt photo.png --device ""
+```
+
+A device is chosen by preference — discrete, then integrated, then software —
+unless a substring of its name is given, as `--device` for the picture engine
+and as `ILL_VULKAN_DEVICE` for the text one, which has no room for a second
+flag beside `--backend`. The preference is wrong exactly once, on a laptop
+where the integrated part shares the memory the model already sits in, and
+naming the device is how that is said.
+
+### What it refuses
+
+**A dependency.** There is no `vulkan.h`, no SDK, no `-lvulkan`, and no second
+build step. Part 1 declares the two dozen structures and fifty entry points
+the file uses against the published ABI and opens the loader with `dlopen`. A
+`--vulkan` build on a host with no Vulkan compiles, runs, and reports the
+backend unavailable; the caller keeps the CPU one. Two ABI conventions carry
+the weight and are written down rather than assumed: dispatchable handles are
+pointers and non-dispatchable handles are always 64 bits, on a 32 bit host as
+much as a 64 bit one; and every structure begins with a tag the driver reads.
+
+**A shader compiler.** Part 3 is a SPIR-V assembler and part 4 writes the
+kernels against it, so the shaders are built at run time and there is no blob in
+the tree. Two shortcuts keep it readable. No phi nodes: every value that
+crosses a branch is an `OpVariable` in the Function storage class, which is
+what glslang emits before its own mem2reg pass and what a driver turns back
+into registers — it removes the hard part of emitting structured control flow
+by hand and costs nothing. One buffer shape: every binding is
+`struct { float cell[]; }` in the Uniform storage class with the BufferBlock
+decoration, which is how a storage buffer is spelled in SPIR-V 1.0 and
+therefore works on a Vulkan 1.0 driver; integers ride through `OpBitcast`, and
+the push constants are sixteen raw words read the same way. One descriptor
+layout and one push range serve all fourteen kernels.
+
+**Quantised weights on the device.** A plane is widened to f32 on the way
+across, through `ill_plane_row` — the engine's own widening — so the device is
+handed exactly the values the CPU dot product would have reconstructed. It is
+exact and it gives back the memory that q4 exists to save: the 2.6B
+checkpoint's 1.57 GiB at q4 is 10.0 GiB of f32 on the device. `TODO.md` item
+52 is the packed form.
+
+### The parts
+
+```
+ 1  abi         what this file declares of Vulkan, and the loader
+ 2  device      instance, queue, memory types, buffers, submission
+ 3  spirv       the assembler the kernels are written against
+ 4  kernels     the fourteen shaders
+ 5  pipelines   modules, layouts, descriptors, dispatch
+ 6  residence   device copies of host memory, and the weight cache
+ 7  open/close  choosing a device and standing it up
+ 8  vulk_op     one operation, end to end
+ 9  IllBackend  the text table
+10  YoloBackend the picture table
+11  probe       the comparison, under VULK_MAIN or VULK_PROBE
+```
+
+Three habits run through part 4 and are worth knowing before reading any one
+kernel. **A dispatch is a grid stride loop**, because Vulkan guarantees only
+65535 workgroups in a dimension and a vocabulary projection wants 65536 rows;
+that makes the workgroup count a tuning knob rather than a correctness
+requirement. **A workgroup is sixty-four invocations, everywhere** — the floor
+Vulkan guarantees is 128, so 64 is safe on anything. **Reductions go through
+workgroup memory**, not through a subgroup add, which would be faster on every
+device that has one and would need a capability to probe for and fall back
+from.
+
+Two kernels are not restatements of the CPU's.
+
+**Attention streams.** The CPU writes the whole score row, softmaxes it, and
+mixes; that needs `span` floats of scratch a worker, which the seam supplies as
+`board`. A device would need `tokens * heads * span` — 256 MiB at a 512 token
+prefill with 32 heads and a 4096 window, for a step whose output is 4 MiB. So
+the device kernel takes one workgroup to a `(token, head)` pair, walks the
+causal span in chunks of sixty-four, and keeps a running maximum and a running
+total, both rescaled whenever the maximum moves, with the partial mix living in
+the output row. Same answer, one pass, no scratch, and `board` unused.
+
+**Convolution is direct.** The CPU lowers a patch matrix and multiplies,
+because a contiguous stream is what a compiler vectorises. On a device the
+lowering is nine reads and nine writes of the whole feature map for a 3x3, all
+through memory, where the direct form reads the input nine times out of cache
+and writes the output once. So `conv_room` answers zero: there is nothing to
+lower into.
+
+### What it costs, and what is in the way
+
+Both seams pass host pointers. `dense` is handed a `const float *src` and a
+`float *dst`; `conv_run` is handed two `YoloPlane`s over malloc memory. There
+is nowhere in either interface to say that an answer is already on the device,
+so **every operation uploads its inputs and downloads its outputs**. Weights
+are cached by host pointer, because they are immutable after a model is loaded
+and they are most of the bytes; activations are not, because nothing in the
+seam says when the host last wrote them.
+
+On `xeon-2.1`, yolo26n over a 320 picture is 139 submissions and 46.4 MiB moved
+against 12 MiB of resident weights — a feature map crosses about four times,
+out of the convolution that made it, into the concatenation, out again, into
+the next convolution. One `logits` call on the 2.6B text checkpoint is 320
+submissions and 196.7 MiB. Both engines' command lines will print those two
+numbers.
+
+So this backend wins on large shapes and loses on small ones, and on a
+synchronous per-operation seam the submit-and-wait around a dispatch can cost
+more than the arithmetic inside it. `TODO.md` item 51 is the fix, and it is a
+change to `app/core.c` and `app/yolo.c` rather than to this file.
+
+**Every number ever measured for this backend was taken on SwiftShader**, a
+software rasterizer. None of them is a GPU rate. What a discrete card does with
+these kernels is item 55, marked blocked.
+
+### How it is checked
+
+Part 11 compares each table against the CPU one over the same input and reports
+through a callback, so `VULK_MAIN` (a standalone command) and `VULK_PROBE`
+(`test/test.c`) share one copy of the comparison rather than two that could
+drift. The tolerance is relative, not bit for bit, and deliberately: the dense
+kernel folds sixty-four partial sums through a tree where the CPU walks the
+row, and no reordering of floating point addition is exact. Everything agrees
+to about a part in a million — 5.8e-07 on dense, 7.2e-07 on attention across
+several chunks, 1.14e-06 over a whole 2.6B forward pass with the top fifty
+logits in the same order, greedy text following the CPU's character for
+character, and yolo26n reporting identical detections.
+
+`ILL_VULKAN_STAGED` in the environment makes the memory picker refuse a
+unified memory type and take the staging path instead — the one every discrete
+card takes, and the one nothing on a host with only a software device would
+otherwise run. The checks pass under it as well as without it.
+
+A host with no device runs no comparisons, which the suite says rather than
+failing: there is nothing to compare against.
+
+### Naming
+
+`vulk_` for the backend, `spv_` for the assembler, and the same field suffixes
+as everywhere else. A few are worth pointing at. A **slab** is a device buffer
+and the memory behind it; a **hold** is one cached upload of immutable host
+memory, keyed on the pointer *and* the byte count, because the same address at
+a different length is a different tensor. `sent` counts how many times the host
+waited on the device and `moved` counts the bytes that crossed — the two
+numbers that say whether the interface or the arithmetic is what is in the way.
