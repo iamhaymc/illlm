@@ -7,9 +7,9 @@
 </tbody>
 </table>
 
-A fast and tiny inference engine,
+A fast and tiny inference engine
 written in pure and portable C11
-where computation uses CPU or Vulkan.
+supporting Vulkan acceleration.
 
 ## ✴️ QUICKSTART
 
