@@ -9,8 +9,8 @@
 
 A fast and tiny inference engine
 
-In pure and optimized C11 that
-utilizes CPU or Vulkan acceleration.
+Written in pure and portable C11
+with support for CPU and Vulkan
 
 ## ✴️ QUICKSTART
 
