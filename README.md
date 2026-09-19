@@ -7,8 +7,7 @@
 </tbody>
 </table>
 
-A fast and tiny engine for 
-agentic inference and vision
+A fast and tiny inference engine
 
 In pure and optimized C11 that
 utilizes CPU or Vulkan acceleration.
